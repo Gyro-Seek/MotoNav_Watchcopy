@@ -1,0 +1,93 @@
+name: Build and publish iOS and universal firmware
+on:
+  push:
+    branches: [main]
+    paths: [RELEASE_VERSION, .github/workflows/release-ios.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: motonav-public-release
+  cancel-in-progress: false
+jobs:
+  release:
+    runs-on: macos-26
+    timeout-minutes: 45
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Detect firmware source changes
+        id: firmware
+        shell: bash
+        run: |
+          PREVIOUS=$(git describe --tags --match 'ios-v*' --abbrev=0 HEAD 2>/dev/null || true)
+          if [[ -n "$PREVIOUS" ]] && git diff --quiet "$PREVIOUS" HEAD -- firmware; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Verify arrival lifecycle and callback sessions
+        run: |
+          swiftc ios/MotoNav/ArrivalPolicy.swift ios/tests/arrival/main.swift -o /tmp/arrival
+          /tmp/arrival
+          swiftc ios/MotoNav/ArrivalPolicy.swift ios/MotoNav/NaviSessionCallbacks.swift ios/tests/arrival-relay/SDKStubs.swift ios/tests/arrival-relay/main.swift -o /tmp/arrival-relay
+          /tmp/arrival-relay
+      - name: Install locked iOS dependencies
+        working-directory: ios
+        run: |
+          sudo gem install cocoapods -v 1.16.2 --no-document
+          pod _1.16.2_ install --deployment
+      - name: Build unsigned iPhone IPA
+        run: ./scripts/build-ios-ipa.sh
+      - name: Verify iOS data and BLE behavior
+        run: |
+          swiftc -O ios/MotoNav/MapGeo.swift ios/MotoNav/RasterProcessing.swift ios/MotoNav/RouteMapPlan.swift ios/tests/maps/main.swift -o /tmp/maps
+          /tmp/maps
+          swiftc ios/MotoNav/BleBulkWriteQueue.swift ios/MotoNav/BleWritePacer.swift ios/tests/ble-bulk/main.swift -o /tmp/bulk
+          /tmp/bulk
+          swiftc ios/MotoNav/BleWritePacer.swift ios/tests/ble-pacing/main.swift -o /tmp/pacing
+          /tmp/pacing
+          python3 -m unittest discover -s firmware/tests -p 'test_*.py'
+      - name: Install ESP32 build tools
+        if: steps.firmware.outputs.changed == 'true'
+        run: |
+          brew install arduino-cli
+          arduino-cli config init
+          arduino-cli config add board_manager.additional_urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
+          arduino-cli core update-index
+          arduino-cli core install esp32:esp32@3.3.10
+      - name: Build universal round-screen firmware
+        if: steps.firmware.outputs.changed == 'true'
+        run: python3 firmware/build.py
+      - name: Package source, firmware and instructions
+        shell: bash
+        run: |
+          VERSION=$(cat RELEASE_VERSION)
+          test -f "output/ios/MotoNav-${VERSION}-unsigned.ipa"
+          git archive --format=zip --prefix=MotoNav/ HEAD > "output/ios/MotoNav-${VERSION}-source.zip"
+          if [[ -d firmware/dist/175/panel0 ]]; then
+            zip -qr "output/ios/MotoNav-universal-firmware-7.12.0.zip" firmware/dist/175/panel0
+          fi
+          cp docs/INSTALL-IOS.md output/ios/INSTALL-IOS.md
+          cp firmware/README.md output/ios/FIRMWARE.md
+          cp "docs/RELEASE-IOS-${VERSION}.md" output/ios/RELEASE-NOTES.md
+          cd output/ios
+          shasum -a 256 *.ipa *.zip *.md > SHA256SUMS.txt
+      - name: Keep build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: motonav-public-release
+          path: output/ios/
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          VERSION=$(cat RELEASE_VERSION)
+          TAG="ios-v${VERSION}"
+          gh release create "$TAG" --target "$GITHUB_SHA" --title "MotoNav iOS ${VERSION} · 通用圆屏 7.12.0" --notes-file "docs/RELEASE-IOS-${VERSION}.md" --draft
+          gh release upload "$TAG" output/ios/*.ipa output/ios/*.zip output/ios/*.md output/ios/SHA256SUMS.txt
+          gh release edit "$TAG" --draft=false

@@ -1,0 +1,58 @@
+# Local tools, generated identities and output
+.tools/
+output/
+**/.gradle/
+**/.kotlin/
+**/.local/
+**/.build/
+**/build/
+**/dist/
+**/local.properties
+**/personal.properties
+**/keystore/
+*.jks
+*.keystore
+*.p12
+*.pfx
+*.pem
+*.key
+*.apk
+*.aab
+*.log
+.env
+.env.*
+private*
+# iOS generated dependencies and local signing
+**/Pods/
+**/DerivedData/
+**/xcuserdata/
+*.xcuserstate
+.DS_Store
+
+# Public release outputs and signing profiles
+*.ipa
+*.xcarchive/
+*.mobileprovision
+*.dSYM/
+
+__pycache__/
+*.pyc
+
+# PlatformIO
+.pio/
+.vscode/
+compile_commands.json
+
+# Release outputs
+release/
+
+# IDE
+.idea/
+
+*.pk8
+*.x509.pem
+*.idsig
+*.class
+
+*.ino.cpp
+

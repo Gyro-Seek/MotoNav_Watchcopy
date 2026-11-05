@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>zh_CN</string>
+	<key>CFBundleDisplayName</key>
+	<string>MotoNav</string>
+	<key>CFBundleExecutable</key>
+	<string>$(EXECUTABLE_NAME)</string>
+	<key>CFBundleIdentifier</key>
+	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>$(PRODUCT_NAME)</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>$(MARKETING_VERSION)</string>
+	<key>CFBundleVersion</key>
+	<string>$(CURRENT_PROJECT_VERSION)</string>
+	<key>LSRequiresIPhoneOS</key>
+	<true/>
+	<key>UILaunchScreen</key>
+	<dict/>
+	<key>UIRequiredDeviceCapabilities</key>
+	<array>
+		<string>arm64</string>
+	</array>
+	<key>UISupportedInterfaceOrientations</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+	</array>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>com.example.motonav</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>motonav</string>
+			</array>
+		</dict>
+	</array>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>location</string>
+		<string>bluetooth-central</string>
+		<string>audio</string>
+	</array>
+	<key>NSAppleMusicUsageDescription</key>
+	<string>在圆屏显示系统音乐 App 的歌曲并控制播放、暂停及切歌</string>
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>连接车把上的圆屏，把导航信息发过去</string>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>导航、搜索附近地点、查当地天气需要用到位置</string>
+	<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
+	<string>锁屏骑车时继续导航，需要在后台使用位置</string>
+	<key>NSLocationAlwaysUsageDescription</key>
+	<string>锁屏骑车时继续导航，需要在后台使用位置</string>
+</dict>
+</plist>
