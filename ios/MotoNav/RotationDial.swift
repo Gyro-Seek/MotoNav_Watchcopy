@@ -78,7 +78,7 @@ struct RotationDial: View {
         let dx = p.x - size / 2, dy = p.y - size / 2
        let r2: CGFloat = 15 * 15
         if dx * dx + dy * dy < r2 { return nil }        // 太靠近圆心，角度不稳，不算
-        return atan2(dx, -dy) * 180 / .pi
+        return atan2(dx, -dy) * 180.0 / .pi
     }
 
     private func onDrag(_ p: CGPoint) {
