@@ -1,0 +1,109 @@
+name: 构建 MotoNav 未签名 IPA
+
+# 直接使用仓库里的 ios/ 工程，构建脚本内联，不依赖 scripts/ 目录。
+# 只手动触发，避免上传文件时自动跑半截失败。
+# 成功后在 Actions 页 Artifacts 下载 MotoNav-unsigned-IPA。
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - name: 检出源码
+        uses: actions/checkout@v5
+
+      - name: 仓库内容与工具链自检
+        run: |
+          echo "== 顶层 =="
+          ls -la
+          echo "== ios/ =="
+          ls -la ios | head -30
+          echo "== 关键文件 =="
+          ls -la ios/Podfile ios/Podfile.lock ios/MotoNav.xcodeproj/project.pbxproj 2>&1
+          echo "== workflow 行尾（若见 CRLF 说明本文件被存成 Windows 行尾）=="
+          file .github/workflows/*.yml
+          echo "== 工具版本 =="
+          xcodebuild -version || true
+          ruby -v || true
+
+      - name: 统一 .sh 行尾为 LF（防 Windows CRLF）
+        run: |
+          find . -name '*.sh' -type f -print0 | xargs -0 perl -pi -e 's/\r\n/\n/g' 2>/dev/null || true
+          file scripts/*.sh 2>/dev/null || echo "(仓库无 scripts/*.sh，本 workflow 不依赖它)"
+
+      - name: 安装 CocoaPods 1.16.2（与 Podfile.lock 一致）
+        run: sudo gem install cocoapods -v 1.16.2 --no-document
+
+      - name: 检查构建所需命令（提前拦住 exit 127）
+        run: |
+          export PATH="/usr/local/bin:/opt/homebrew/bin:$PATH"
+          for c in pod xcodebuild ditto zip shasum /usr/libexec/PlistBuddy /usr/bin/zip; do
+            command -v "$c" >/dev/null || { echo "缺少命令: $c"; exit 1; }
+          done
+          echo "== pod / xcodebuild =="
+          pod --version
+          xcodebuild -version
+
+      - name: 编译并打包未签名 IPA（脚本内联）
+        run: |
+          set -euo pipefail
+          export PATH="/usr/local/bin:/opt/homebrew/bin:$PATH"
+          ROOT="$PWD"
+          OUT="$ROOT/output"
+          mkdir -p "$OUT"
+
+          echo "==> 1/4 安装锁定依赖（AMapNavi 10.1.600 / AMapSearch 9.7.5）"
+          cd "$ROOT/ios"
+          pod install --deployment || pod install
+          cd "$ROOT"
+
+          echo "==> 2/4 编译 iPhone arm64 Release（不签名）"
+          DERIVED="$OUT/Derived"
+          rm -rf "$DERIVED"
+          xcodebuild -workspace ios/MotoNav.xcworkspace -scheme MotoNav \
+            -destination 'generic/platform=iOS' -configuration Release \
+            -derivedDataPath "$DERIVED" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO DEVELOPMENT_TEAM= build \
+            2>&1 | tee "$OUT/build-ios.log"
+
+          APP="$DERIVED/Build/Products/Release-iphoneos/MotoNav.app"
+          test -d "$APP" || { echo "未找到 MotoNav.app，编译失败，详见 output/build-ios.log"; exit 1; }
+          VERSION=$(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' "$APP/Info.plist")
+          echo "    版本 $VERSION"
+
+          echo "==> 3/4 清理签名残留并打包 Payload"
+          STAGE=$(mktemp -d /tmp/MotoNavPayload.XXXXXX)
+          trap 'rm -rf "$STAGE"' EXIT
+          mkdir -p "$STAGE/Payload"
+          ditto "$APP" "$STAGE/Payload/MotoNav.app"
+          find "$STAGE" -name _CodeSignature -type d -prune -exec rm -rf {} +
+          find "$STAGE" -name embedded.mobileprovision -delete
+          xcrun strip -S "$STAGE/Payload/MotoNav.app/MotoNav" 2>/dev/null || true
+          if [ -f "$STAGE/Payload/MotoNav.app/PlugIns/MotoNavShare.appex/MotoNavShare" ]; then
+            xcrun strip -S "$STAGE/Payload/MotoNav.app/PlugIns/MotoNavShare.appex/MotoNavShare" 2>/dev/null || true
+            echo "    主应用 + 分享扩展均在"
+          else
+            echo "    注意：分享扩展缺失"
+          fi
+
+          IPA="$OUT/MotoNav-$VERSION-unsigned.ipa"
+          rm -f "$IPA"
+          (cd "$STAGE" && /usr/bin/zip -qry "$IPA" Payload)
+          (cd "$OUT" && shasum -a 256 "$(basename "$IPA")" > SHA256SUMS.txt)
+
+          echo "==> 4/4 完成"
+          echo "已生成：$IPA"
+
+      - name: 上传 IPA 与日志
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: MotoNav-unsigned-IPA
+          path: output/
+          if-no-files-found: warn
+          retention-days: 30
