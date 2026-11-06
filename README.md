@@ -1,3 +1,17 @@
+使用SOP:
+1. 打开workbuddy，注册账号
+2. 将该仓库地址直接给workbuddy，告知它3件事：
+   2.1. 安装esp32依赖
+   2.2. 设备为微雪esp32-s3 1.75，我用的电脑是Mac/Windows，生成一键烧录
+   2.3. 我的手机是iPhone，生成ipa（安卓手机的话，让workbuddy把代码拉下来，并点击一键打包.bat）
+3. 前往[高德开放平台](https://console.amap.com/)登录账号
+4. 连接微雪esp32，打开一键烧录，出现开机画面就成功了。不成功找workbuddy。
+5. ios:下载Sideloadly，用Sideloadly安装ipa，注意开启开发者模式和信任作者；Andorid：手机直接安装apk
+6. ios:打开软件，使用软件上显示的bundle id，在高德开放平台生成key，并把key填入软件中。因为ios需要每7天签名一次，所以记好bundle id
+   Android: output/Application-info中有SHA1和Package Name，在高德开放平台生成key，并把key填入软件中。
+7. 剩下的你就玩吧，自己摸索。一定要做好备份！！！
+-----------------------------------------------------------------------------------------------------------------------
+以下为原作者内容，感谢原作者开源，郑重感谢！！！跪拜不止！！！
 # MotoNav for M5Stack Stopwatch
 
 本项目是专为 **M5Stack Stopwatch**（1.75 英寸 466×466 AMOLED 圆屏设备）深度适配与独立维护的摩托车/自行车骑行导航仪系统。
