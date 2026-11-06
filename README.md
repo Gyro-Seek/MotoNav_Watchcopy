@@ -1,3 +1,4 @@
+设备为 微雪esp32-s3 1.75
 使用SOP:
 1. 打开workbuddy，注册账号
 2. 将该仓库地址直接给workbuddy，告知它3件事：
