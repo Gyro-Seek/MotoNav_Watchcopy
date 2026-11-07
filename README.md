@@ -7,10 +7,22 @@
    2.3. 我的手机是iPhone，生成ipa（安卓手机的话，让workbuddy把代码拉下来，并点击一键打包.bat）
 3. 前往[高德开放平台](https://console.amap.com/)登录账号
 4. 连接微雪esp32，打开一键烧录，出现开机画面就成功了。不成功找workbuddy。
-5. ios:下载Sideloadly，用Sideloadly安装ipa，注意开启开发者模式和信任作者；Andorid：手机直接安装apk
+***5. ios:下载Sideloadly，用Sideloadly安装ipa，注意提前安装iTunes和iCloud。开启开发者模式和信任作者；Andorid：手机直接安装apk
 6. ios:打开软件，使用软件上显示的bundle id，在高德开放平台生成key，并把key填入软件中。因为ios需要每7天签名一次，所以记好bundle id
    Android: output/Application-info中有SHA1和Package Name，在高德开放平台生成key，并把key填入软件中。
 7. 剩下的你就玩吧，自己摸索。一定要做好备份！！！
+
+***对于第5步的更新：由于ios每7天要打开电脑重新签名一次，过于麻烦，以下是曲线救国的方法：
+1. 电脑安装iloader，用iloader为iPhone安装Sidestore
+2. iPhone下载安装LocalDevVPN
+3. 打开Sidestore，开启LocalDevVPN，Sidestore登录apple id
+4. 如果登陆不了，Sidestore做如下设置：
+   <img width="924" height="624" alt="1630139841" src="https://github.com/user-attachments/assets/f3468a40-f4eb-4651-b8da-3fcf21084e14" />
+<img width="1072" height="708" alt="857736394" src="https://github.com/user-attachments/assets/e351ccb7-354a-4b27-912d-cb526674b389" />
+5. 使用iloader安装ipa
+6. 将ipa拖入iCloud
+7. 在Sidestore My Apps中添加该ipa
+8. 设置苹果的自动化，定义每周的某几天的几点（这个点最好是你一定会连着wifi的点），自动开启LocalDevVPN，Sidestore refresh all apps，然后关闭VPN
 -----------------------------------------------------------------------------------------------------------------------
 以下为原作者内容，感谢原作者开源，郑重感谢！！！跪拜不止！！！
 # MotoNav for M5Stack Stopwatch
