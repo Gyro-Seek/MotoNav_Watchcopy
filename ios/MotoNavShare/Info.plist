@@ -5,7 +5,7 @@
 	<key>CFBundleDevelopmentRegion</key>
 	<string>zh_CN</string>
 	<key>CFBundleDisplayName</key>
-	<string>MotoNav</string>
+	<string>分享到 MotoNav</string>
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
 	<key>CFBundleIdentifier</key>
@@ -24,13 +24,14 @@
 	<dict>
 		<key>NSExtensionAttributes</key>
 		<dict>
-			<!-- v2：放宽激活规则。原规则只认 public.url / public.plain-text，
-			     苹果地图分享地点时带的是 public.url + public.text / public.vcard / public.data，
-			     有时会被过滤掉，导致分享面板里根本看不到 MotoNav。
-			     个人侧载 App 如果还想更激进，可以把下面整个字符串直接换成 TRUEPREDICATE，
-			     MotoNav 就会出现在所有分享面板里。 -->
+			<!-- 侧载 / 个人签名用 TRUEPREDICATE：MotoNav 出现在所有分享面板里。
+			     原因：高德「路线分享」有时只给图片卡片(public.image/public.card)，
+			     苹果地图给 public.plain-text + public.url + com.apple.mapkit.map-item +
+			     public.vcard，原来的复杂 SUBQUERY 只要有一个类型没匹配上，
+			     分享面板里就根本看不到 MotoNav。
+			     如果要上架 App Store，必须换成 Apple 允许的精确 SUBQUERY 规则。 -->
 			<key>NSExtensionActivationRule</key>
-			<string>SUBQUERY(extensionItems, $item, SUBQUERY($item.attachments, $att, ANY $att.registeredTypeIdentifiers UTI-CONFORMS-TO "public.url" || ANY $att.registeredTypeIdentifiers UTI-CONFORMS-TO "public.text" || ANY $att.registeredTypeIdentifiers UTI-CONFORMS-TO "public.plain-text" || ANY $att.registeredTypeIdentifiers UTI-CONFORMS-TO "public.vcard" || ANY $att.registeredTypeIdentifiers UTI-CONFORMS-TO "public.content" || ANY $att.registeredTypeIdentifiers UTI-CONFORMS-TO "public.data").@count >= 1).@count >= 1</string>
+			<string>TRUEPREDICATE</string>
 		</dict>
 		<key>NSExtensionPointIdentifier</key>
 		<string>com.apple.share-services</string>
