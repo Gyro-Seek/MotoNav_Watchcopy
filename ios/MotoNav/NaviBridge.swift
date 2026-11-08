@@ -62,7 +62,7 @@ final class NaviBridge: NSObject, ObservableObject {
     @Published var selectedRouteID = -1
     @Published var shareMatch = ""                  // 和分享路线的吻合程度
     @Published private(set) var shareRoute: AmapShare.Route?
-    struct Via { let name: String; let lat: Double; let lng: Double }
+    struct Via: Identifiable { let id = UUID(); let name: String; let lat: Double; let lng: Double }
     @Published private(set) var vias: [Via] = []     // iOS v0.4 途经点（分享的路线自带途经点，不用这个）
     var destCoord: CLLocationCoordinate2D? { destLat.isNaN ? nil : CLLocationCoordinate2D(latitude: destLat, longitude: destLng) }
     private var destLat = Double.nan, destLng = Double.nan
@@ -242,6 +242,22 @@ final class NaviBridge: NSObject, ObservableObject {
     func clearVias() {
         if vias.isEmpty { return }
         vias = []
+        replan()
+    }
+
+    /// 单独删一个途经点并重新规划（途经点管理页用）
+    func removeVia(id: UUID) {
+        guard shareRoute == nil, let i = vias.firstIndex(where: { $0.id == id }) else { return }
+        vias.remove(at: i)
+        replan()
+    }
+
+    /// 拖动调序（SwiftUI onMove：src 是原下标，dst 是移动后的目标位置）
+    func moveVia(from src: Int, to dst: Int) {
+        guard shareRoute == nil, vias.indices.contains(src), dst >= 0 else { return }
+        let v = vias.remove(at: src)
+        let target = dst > src ? dst - 1 : dst
+        vias.insert(v, at: min(max(target, 0), vias.count))
         replan()
     }
 

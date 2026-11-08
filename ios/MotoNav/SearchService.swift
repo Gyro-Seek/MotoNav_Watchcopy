@@ -117,6 +117,13 @@ final class History: ObservableObject {
 
     func clear() { places = []; save() }
 
+    /// 单条删除（首页「最近去过」左滑删除用）
+    func remove(_ p: SearchService.Place) {
+        guard let i = places.firstIndex(where: { $0.id == p.id }) else { return }
+        places.remove(at: i)
+        save()
+    }
+
     private func save() {
         UserDefaults.standard.set(places.map { ["n": $0.name, "a": $0.address, "la": $0.lat, "lo": $0.lng] as [String: Any] }, forKey: key)
     }

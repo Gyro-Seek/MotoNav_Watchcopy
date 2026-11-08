@@ -38,6 +38,8 @@ struct ContentView: View {
     @State private var autoPickResult = false       // 只有地名时：搜索结果回来自动选第一条
     @State private var cruiseNote = ""
     @State private var addingVia = false               // 正在搜途经点
+    @State private var viaManager = false              // 途经点管理面板（增删 / 拖动排序）
+    @State private var viaEditMode = EditMode.active   // 途经点列表常显拖拽手柄
     @Environment(\.scenePhase) private var scenePhase
     @State private var lastHandledShare = ""        // 去重：onOpenURL 和前台自动消费可能同时到
     @State private var sheetExpanded = false         // 首页底部搜索抽屉：上滑展开更多入口
@@ -214,6 +216,15 @@ struct ContentView: View {
     // MARK: 首页搜索条（固定在抽屉顶部，可上滑）
     private var homeSearchBar: some View {
         HStack(spacing: 8) {
+            if addingVia {
+                Button { cancelViaSearch() } label: {
+                    HStack(spacing: 2) {
+                        Image(systemName: "chevron.left")
+                        Text("返回")
+                    }
+                    .font(.caption).foregroundColor(ContentView.cyan)
+                }
+            }
             Image(systemName: "magnifyingglass").foregroundColor(Self.sub)
             TextField(addingVia ? "搜索途经点（比如加油站）" : "搜索地点、地址", text: $query)
                 .textFieldStyle(.plain)
@@ -240,10 +251,9 @@ struct ContentView: View {
     /// 搜索态有没有内容要展示（决定空闲时抽屉的高度）
     private var hasSearchContent: Bool {
         !search.results.isEmpty || !search.status.isEmpty || !shareStatus.isEmpty
-            || (!history.places.isEmpty && query.isEmpty)
     }
 
-    /// 搜索态：实时检索结果 / 最近去过
+    /// 搜索态：只放实时检索结果；最近去过改到 recentSection，上滑才出现
     @ViewBuilder
     private var searchResultSection: some View {
         if !shareStatus.isEmpty { Text(shareStatus).font(.footnote).foregroundColor(ContentView.sub) }
@@ -264,25 +274,147 @@ struct ContentView: View {
             }
             Divider().background(ContentView.stroke)
         }
-        if search.results.isEmpty && query.isEmpty && !history.places.isEmpty {
-            Text(addingVia ? "从最近去过里选途经点" : "最近去过").font(.caption).foregroundColor(ContentView.sub)
-            ForEach(history.places.prefix(8)) { p in
-                Button { choose(p) } label: {
-                    HStack(alignment: .center, spacing: 8) {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(p.name).foregroundColor(.white)
-                            if !p.address.isEmpty { Text(p.address).font(.caption).foregroundColor(ContentView.sub).lineLimit(1) }
-                        }
-                        Spacer(minLength: 4)
-                        if let d = distanceTo(p) { Text(d).font(.caption).foregroundColor(ContentView.cyan) }
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.vertical, 4)
+    }
+
+    /// 最近去过：左滑单条删除；只在抽屉上滑展开 / 搜途经点时出现
+    private var recentSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text(addingVia ? "从最近去过里选途经点" : "最近去过")
+                    .font(.caption).foregroundColor(ContentView.sub)
+                Spacer()
+                if !history.places.isEmpty {
+                    Button("清除记录") { history.clear() }
+                        .font(.caption).foregroundColor(ContentView.sub)
                 }
-                Divider().background(ContentView.stroke)
             }
-            Button("清除记录") { history.clear() }.font(.caption).foregroundColor(ContentView.sub)
+            if history.places.isEmpty {
+                Text("暂无记录").font(.caption2).foregroundColor(ContentView.sub)
+            } else {
+                recentList
+            }
         }
+    }
+
+    /// 只有 List 的行支持系统 swipeActions；固定高度避免和外层 ScrollView 抢滚动
+    private var recentList: some View {
+        let rows: [SearchService.Place] = Array(history.places.prefix(8))
+        let h: CGFloat = CGFloat(rows.count) * 54
+        return List {
+            ForEach(rows) { p in recentRow(p) }
+        }
+        .listStyle(.plain)
+        .background(ContentView.bg)
+        .frame(height: h)
+    }
+
+    private func recentRow(_ p: SearchService.Place) -> some View {
+        Button { choose(p) } label: {
+            HStack(alignment: .center, spacing: 8) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(p.name).foregroundColor(.white).lineLimit(1)
+                    if !p.address.isEmpty {
+                        Text(p.address).font(.caption).foregroundColor(ContentView.sub).lineLimit(1)
+                    }
+                }
+                Spacer(minLength: 4)
+                if let d = distanceTo(p) { Text(d).font(.caption).foregroundColor(ContentView.cyan) }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.vertical, 4)
+        }
+        .listRowBackground(ContentView.card)
+        .listRowInsets(EdgeInsets(top: 3, leading: 10, bottom: 3, trailing: 10))
+        .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+            Button(role: .destructive) { history.remove(p) } label: {
+                Label("删除", systemImage: "trash")
+            }
+        }
+    }
+
+    /// 途经点管理页顶栏：左「返回」+ 标题 + 右「完成」
+    private var viaManagerBar: some View {
+        HStack(spacing: 8) {
+            Button { closeViaManager() } label: {
+                HStack(spacing: 2) {
+                    Image(systemName: "chevron.left")
+                    Text("返回")
+                }
+                .font(.subheadline).foregroundColor(ContentView.cyan)
+            }
+            Spacer()
+            Text("途经点").font(.headline).foregroundColor(.white)
+            Spacer()
+            Button("完成") { closeViaManager() }
+                .font(.subheadline).foregroundColor(ContentView.pink)
+        }
+        .padding(.horizontal, 14).padding(.vertical, 10)
+    }
+
+    /// 途经点管理页：起点 / 途经点（可单删、可拖动排序）/ 终点 / 添加
+    private var viaManagerPanel: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            CardView {
+                HStack(spacing: 8) {
+                    Image(systemName: "location.fill").foregroundColor(ContentView.cyan)
+                    Text("我的位置").foregroundColor(.white).font(.subheadline)
+                    Spacer()
+                    Text("起点").font(.caption2).foregroundColor(ContentView.sub)
+                }
+            }
+            viaEditList
+            CardView {
+                HStack(spacing: 8) {
+                    Image(systemName: "flag.fill").foregroundColor(ContentView.pink)
+                    Text(dest?.name ?? "目的地").foregroundColor(.white).font(.subheadline).lineLimit(1)
+                    Spacer()
+                    Text("终点").font(.caption2).foregroundColor(ContentView.sub)
+                }
+            }
+            HStack(spacing: 12) {
+                Button { openViaSearch() } label: {
+                    Label("添加途经点", systemImage: "plus.circle.fill")
+                        .font(.subheadline).foregroundColor(ContentView.cyan)
+                }
+                .disabled(navi.vias.count >= 3 || navi.shareRoute != nil)
+                Spacer()
+                if !navi.vias.isEmpty {
+                    Button("清空") { navi.clearVias() }
+                        .font(.caption).foregroundColor(ContentView.sub)
+                }
+            }
+            Text(navi.vias.isEmpty ? "还没有途经点" : "最多 3 个；拖动右侧手柄调序，改动后自动重新规划")
+                .font(.caption2).foregroundColor(ContentView.sub)
+        }
+    }
+
+    /// 途经点列表：系统 onMove 拖拽排序 + 每行单独删除按钮
+    private var viaEditList: some View {
+        let h: CGFloat = CGFloat(navi.vias.count) * 50
+        return List {
+            ForEach(navi.vias) { v in viaRow(v) }
+                .onMove { src, dst in
+                    if let i = src.first { navi.moveVia(from: i, to: dst) }
+                }
+        }
+        .environment(\.editMode, $viaEditMode)
+        .listStyle(.plain)
+        .background(ContentView.bg)
+        .frame(height: max(h, 8))
+    }
+
+    private func viaRow(_ v: NaviBridge.Via) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: "circle.fill").font(.system(size: 6)).foregroundColor(ContentView.cyan)
+            Text(v.name).foregroundColor(.white).font(.subheadline).lineLimit(1)
+            Spacer(minLength: 4)
+            Button { navi.removeVia(id: v.id) } label: {
+                Image(systemName: "minus.circle.fill").foregroundColor(.red)
+            }
+            .buttonStyle(.borderless)
+        }
+        .listRowBackground(ContentView.card)
+        .listRowInsets(EdgeInsets(top: 3, leading: 10, bottom: 3, trailing: 10))
     }
 
     /// 地点态：地名 + 地址 + 「路线」按钮（点路线才开始算路）
@@ -344,13 +476,11 @@ struct ContentView: View {
                     Text(viaSummary)
                         .font(.caption).foregroundColor(ContentView.sub).lineLimit(2)
                     Spacer(minLength: 4)
-                    if !navi.vias.isEmpty {
-                        Button("清除") { navi.clearVias() }.font(.caption).foregroundColor(ContentView.sub)
+                    Button { openViaManager() } label: {
+                        Label(navi.vias.isEmpty ? "添加途经点" : "途经点管理",
+                              systemImage: navi.vias.isEmpty ? "plus.circle" : "ellipsis.circle")
+                            .font(.caption).foregroundColor(ContentView.cyan)
                     }
-                    Button { beginViaSearch() } label: {
-                        Label("添加途经点", systemImage: "plus.circle").font(.caption).foregroundColor(ContentView.cyan)
-                    }
-                    .disabled(navi.vias.count >= 3)
                 }
             }
             Toggle("不走高速", isOn: $settings.avoidHighway)
@@ -402,7 +532,7 @@ struct ContentView: View {
     private func backToSearch() {
         navi.clearPlan()
         dest = nil; homeFocus = nil; homeStage = .idle
-        sheetExpanded = false; addingVia = false
+        sheetExpanded = false; addingVia = false; viaManager = false
         pendingSearchSubmit = false; autoStartNavi = false
     }
 
@@ -422,13 +552,44 @@ struct ContentView: View {
         navi.plan(toLat: d.lat, lng: d.lng)
     }
 
-    /// 点「添加途经点」：搜索框临时切成途经点搜索，选完回到路线态
-    private func beginViaSearch() {
+    /// 打开途经点管理面板（参考高德：起点 / 途经点可增删可排序 / 终点）
+    private func openViaManager() {
+        hideKeyboard()
+        addingVia = false
+        viaManager = true
+        homeStage = .routes
+        sheetExpanded = false
+    }
+
+    /// 管理页点「+ 添加途经点」→ 进入搜索（搜索条自带返回按钮）
+    private func openViaSearch() {
+        guard navi.vias.count < 3, navi.shareRoute == nil else { return }
+        viaManager = false
         addingVia = true
+        homeStage = .idle
+        sheetExpanded = false
         setQuery("")
         search.clear()
+    }
+
+    /// 途经点搜索页「返回」：回到管理页
+    private func cancelViaSearch() {
+        hideKeyboard()
+        searchWork?.cancel()
+        addingVia = false
+        setQuery("")
+        search.clear()
+        viaManager = true
+        homeStage = .routes
+    }
+
+    /// 管理页「返回 / 完成」：回到路线面板
+    private func closeViaManager() {
+        viaManager = false
+        addingVia = false
+        homeStage = .routes
         sheetExpanded = false
-        homeStage = .idle
+        overviewToken += 1
     }
 
     /// 离现在位置的直线距离（搜索结果、最近去过右边显示）
@@ -457,6 +618,8 @@ struct ContentView: View {
             addingVia = false
             setQuery(dest?.name ?? "")
             if !needAmapKey() { navi.addVia(name: p.name, lat: p.lat, lng: p.lng) }
+            History.shared.add(p)
+            viaManager = true          // 加完回管理页，可继续增删 / 排序
             homeStage = .routes
             overviewToken += 1
             return
@@ -685,6 +848,8 @@ struct ContentView: View {
     /// 面板高度跟着阶段走：空闲最矮，搜索结果 / 地点 / 路线依次升高
     private func panelHeight(_ geo: GeometryProxy) -> CGFloat {
         if sheetExpanded { return min(geo.size.height * 0.82, 640) }
+        if viaManager { return min(geo.size.height * 0.64, 480) }
+        if addingVia { return min(geo.size.height * 0.52, 400) }
         if homeStage == .place { return 200 }
         if homeStage == .routes { return min(geo.size.height * 0.48, 350) }
         return hasSearchContent ? min(geo.size.height * 0.52, 400) : 122
@@ -692,7 +857,7 @@ struct ContentView: View {
 
     /// 抽屉：抓手 + 搜索框固定；上滑在任何阶段都能展开功能入口
     private func homeDrawer(height: CGFloat) -> some View {
-        let showList = sheetExpanded || homeStage != .idle || hasSearchContent
+        let showList = sheetExpanded || viaManager || addingVia || homeStage != .idle || hasSearchContent
         return VStack(spacing: 0) {
             if !showList { Spacer(minLength: 0) }
 
@@ -701,7 +866,11 @@ struct ContentView: View {
                     .frame(maxWidth: .infinity, minHeight: 22)
                     .contentShape(Rectangle())
                     .onTapGesture { toggleSheet() }
-                homeSearchBar.padding(.horizontal, 14).padding(.bottom, 10)
+                if viaManager {
+                    viaManagerBar
+                } else {
+                    homeSearchBar.padding(.horizontal, 14).padding(.bottom, 10)
+                }
             }
             // 手势只加在「抓手 + 搜索框」区域，避免和下面列表滚动打架
             .gesture(DragGesture(minimumDistance: 24).onEnded { v in
@@ -712,22 +881,27 @@ struct ContentView: View {
             if showList {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 12) {
-                        if homeStage == .idle {
-                            searchResultSection
-                        } else if homeStage == .place {
-                            placeCard
+                        if viaManager {
+                            viaManagerPanel
                         } else {
-                            routePanel
-                        }
-                        if sheetExpanded {
-                            shareImportCard
-                            cruiseCard
-                            routeModeButtons
-                            favoritesCard
-                            ridesCard
-                        }
-                        if !shareStatus.isEmpty && homeStage != .idle {
-                            Text(shareStatus).font(.caption2).foregroundColor(ContentView.sub)
+                            if homeStage == .idle {
+                                searchResultSection
+                            } else if homeStage == .place {
+                                placeCard
+                            } else {
+                                routePanel
+                            }
+                            if addingVia || sheetExpanded { recentSection }
+                            if sheetExpanded {
+                                shareImportCard
+                                cruiseCard
+                                routeModeButtons
+                                favoritesCard
+                                ridesCard
+                            }
+                            if !shareStatus.isEmpty && homeStage != .idle {
+                                Text(shareStatus).font(.caption2).foregroundColor(ContentView.sub)
+                            }
                         }
                         Color.clear.frame(height: 6)
                     }
@@ -745,6 +919,7 @@ struct ContentView: View {
         .animation(.spring(response: 0.34, dampingFraction: 0.86), value: homeStage)
         .animation(.spring(response: 0.34, dampingFraction: 0.86), value: sheetExpanded)
         .animation(.spring(response: 0.34, dampingFraction: 0.86), value: hasSearchContent)
+        .animation(.spring(response: 0.34, dampingFraction: 0.86), value: viaManager)
     }
 
     private func setSheet(_ v: Bool) {
