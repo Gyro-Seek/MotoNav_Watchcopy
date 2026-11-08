@@ -5,7 +5,7 @@ import Combine
 
 /// 版本：跟随 App 版本（见 Config.swift）
 ///
-/// 主界面：圆屏连接状态、搜索目的地 / 导入高德分享路线、选路线、开始导航、巡航、圆屏设置、Key 设置、调试信息
+/// 主界面：首页=高德地图 + 可上滑搜索抽屉；其余页=圆屏显示 / 导航语音 / 圆屏设置 / 地图 Key
 /// （罪恶都市风深色界面）
 struct ContentView: View {
     @ObservedObject var ble = BleLink.shared
@@ -39,6 +39,7 @@ struct ContentView: View {
     @State private var addingVia = false               // 正在搜途经点
     @Environment(\.scenePhase) private var scenePhase
     @State private var lastHandledShare = ""        // 去重：onOpenURL 和前台自动消费可能同时到
+    @State private var sheetExpanded = false         // 首页底部搜索抽屉：上滑展开更多入口
 
     static let bg = Color(red: 0.055, green: 0.04, blue: 0.08)
     static let card = Color(red: 0.10, green: 0.08, blue: 0.14)
@@ -51,28 +52,25 @@ struct ContentView: View {
         VStack(spacing: 0) {
             activeNavigationBanner
             ZStack {
-                ForEach(0..<5) { index in
+                // 首页（index 0）是地图 + 底部抽屉，不再是纵向卡片列表
+                ForEach(1..<5) { index in
                     ScrollView {
                         VStack(alignment: .leading, spacing: 16) {
                             header
-                            if index == 0 {
-                                cruiseCard
-                                statusCard
-                                HStack {
-                                    Button("摩托车路线规划") { if !independent.running {independent.arrived=false}; independentMode = .motorcycle; showWebMotor = true }.foregroundColor(Self.pink)
-                                    Spacer()
-                                    Button("自行车路线规划") { if !independent.running {independent.arrived=false}; independentMode = .bicycle; showWebMotor = true }.foregroundColor(Self.cyan)
-                                }
-                                destCard
-                                favoritesCard
-                                Button("骑行轨迹") { showRides = true }.foregroundColor(Self.cyan)
-                            } else if index == 1 { displayCard }
+                            if index == 1 { displayCard }
                             else if index == 2 { voiceCard }
                             else if index == 3 { statusCard; settingsCard; debugCard }
                             else { keyCard; Text(weather.detail).foregroundColor(Self.sub) }
                         }.padding(16)
-                    }.opacity(page == index ? 1 : 0).allowsHitTesting(page == index).accessibilityHidden(page != index)
+                    }
+                    .opacity(page == index ? 1 : 0)
+                    .allowsHitTesting(page == index)
+                    .accessibilityHidden(page != index)
                 }
+                homePage
+                    .opacity(page == 0 ? 1 : 0)
+                    .allowsHitTesting(page == 0)
+                    .accessibilityHidden(page != 0)
             }
             HStack(spacing: 0) {
                 ForEach(0..<5) { index in
@@ -185,38 +183,39 @@ struct ContentView: View {
         }
     }
 
-    // MARK: 去哪儿
-    private var destCard: some View {
+    // MARK: 首页搜索条（固定在抽屉顶部，可上滑）
+    private var homeSearchBar: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "magnifyingglass").foregroundColor(Self.sub)
+            TextField(addingVia ? "搜索途经点（比如加油站）" : "搜索地点、地址", text: $query)
+                .textFieldStyle(.plain)
+                .foregroundColor(.white)
+                .submitLabel(.search)
+                .onSubmit { if !needAmapKey() { search.search(query) } }
+                .onChange(of: query) { if $0.isEmpty { search.clear() } }
+            Button("搜索") { hideKeyboard(); if !needAmapKey() { search.search(query) } }
+                .font(.subheadline.bold())
+                .foregroundColor(.white)
+                .padding(.horizontal, 14).padding(.vertical, 9)
+                .background(RoundedRectangle(cornerRadius: 10).fill(Self.pink))
+        }
+        .padding(.horizontal, 12).padding(.vertical, 9)
+        .background(RoundedRectangle(cornerRadius: 15).fill(Self.bg))
+    }
+
+    // MARK: 去哪儿（搜索结果 / 目的地 / 路线，放在抽屉里）
+    /// 抽屉里是否有内容可展示。为 false 时整张卡片都不渲染，
+    /// 免得收起态留下一个只有边框和背景的空白「文字框」。
+    private var hasHomeContent: Bool {
+        !shareStatus.isEmpty || !search.status.isEmpty || !search.results.isEmpty
+            || dest != nil
+            || (search.results.isEmpty && (dest == nil || addingVia) && !history.places.isEmpty)
+    }
+
+    @ViewBuilder
+    private var homeDestSection: some View {
+        if hasHomeContent {
         CardView {
-            Text("去哪儿").foregroundColor(.white).bold()
-            HStack(spacing: 10) {
-                // 只在按键盘上的“搜索”或右边按钮时才查高德（边打字边查太费额度）
-                TextField(addingVia ? "搜索途经点（比如加油站）" : "搜索地点、地址", text: $query)
-                    .textFieldStyle(.plain)
-                    .padding(12)
-                    .background(RoundedRectangle(cornerRadius: 12).fill(ContentView.bg))
-                    .foregroundColor(.white)
-                    .submitLabel(.search)
-                    .onSubmit { if !needAmapKey() { search.search(query) } }
-                    .onChange(of: query) { if $0.isEmpty { search.clear() } }
-                Button("搜索") { hideKeyboard(); if !needAmapKey() { search.search(query) } }
-                    .font(.headline)
-                    .foregroundColor(.white)
-                    .padding(.horizontal, 16).padding(.vertical, 12)
-                    .background(RoundedRectangle(cornerRadius: 12).fill(ContentView.pink))
-            }
-            // iOS v0.3 导入高德 App 分享的路线（比如高德里规划好的摩托车路线）
-            if !addingVia {
-            Button { pasteShare() } label: {
-                HStack(spacing: 6) {
-                    Image(systemName: "doc.on.clipboard")
-                    Text(shareBusy ? "正在读取分享内容…" : "粘贴分享的路线 / 地点")
-                }
-                .font(.subheadline).foregroundColor(Color.orange)
-            }
-            .disabled(shareBusy)
-            Text("高德路线、高德地点、苹果地图地点都行：地图里点分享 → 选 MotoNav → 切回本 App（或点通知）即自动开始导航").font(.caption2).foregroundColor(ContentView.sub)
-            }
             if !shareStatus.isEmpty { Text(shareStatus).font(.footnote).foregroundColor(ContentView.sub) }
             if !search.status.isEmpty { Text(search.status).font(.footnote).foregroundColor(ContentView.sub) }
             ForEach(search.results.prefix(8)) { p in
@@ -329,6 +328,7 @@ struct ContentView: View {
                     }
                 }
             }
+        }
         }
     }
 
@@ -496,6 +496,136 @@ struct ContentView: View {
         // 规划失败时别让这个标记一直挂着，避免以后手动规划也被强制自动开始
         DispatchQueue.main.asyncAfter(deadline: .now() + 30) { if autoStartNavi { autoStartNavi = false } }
         navi.plan(toLat: p.lat, lng: p.lng)
+    }
+
+    // MARK: 首页：高德地图打底 + 底部可上滑搜索抽屉
+    private var homePage: some View {
+        GeometryReader { geo in
+            ZStack(alignment: .bottom) {
+                HomeMapView(night: settings.paletteNight)
+                    .ignoresSafeArea()
+
+                // 收起态：没有内容时只留「抓手 + 搜索框」，抽屉变矮，搜索框随之整体下移；
+                // 一旦有搜索结果 / 目的地 / 状态提示，恢复 250pt 保证内容可见。
+                homeDrawer(height: sheetExpanded ? min(geo.size.height * 0.82, 640)
+                                                 : (hasHomeContent ? 250 : 122))
+            }
+        }
+    }
+
+    /// 抽屉：抓手 + 搜索框固定；上滑后下面展开巡航 / 路线规划 / 常用目的地 / 骑行轨迹
+    private func homeDrawer(height: CGFloat) -> some View {
+        let showList = sheetExpanded || hasHomeContent
+        return VStack(spacing: 0) {
+            // 收起且没有内容时，把抓手 + 搜索框推到抽屉底部，地图露出更多
+            if !showList { Spacer(minLength: 0) }
+
+            VStack(spacing: 0) {
+                Capsule().fill(Color.white.opacity(0.32)).frame(width: 42, height: 5)
+                    .frame(maxWidth: .infinity, minHeight: 22)
+                    .contentShape(Rectangle())
+                    .onTapGesture { toggleSheet() }
+
+                homeSearchBar.padding(.horizontal, 14).padding(.bottom, 10)
+            }
+            // 手势只加在「抓手 + 搜索框」区域，避免和下面列表滚动打架
+            .gesture(DragGesture(minimumDistance: 24).onEnded { v in
+                if v.translation.height < -45 { setSheet(true) }
+                else if v.translation.height > 45 { setSheet(false) }
+            })
+
+            if showList {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 14) {
+                        homeDestSection
+                        if sheetExpanded {
+                            shareImportCard
+                            cruiseCard
+                            routeModeButtons
+                            favoritesCard
+                            ridesCard
+                        }
+                        Color.clear.frame(height: 8)
+                    }
+                    .padding(.horizontal, 14).padding(.bottom, 18)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                Color.clear.frame(height: 34)     // 底部留白，避开 home indicator
+            }
+        }
+        .frame(height: height)
+        .frame(maxWidth: .infinity)
+        .background(RoundedRectangle(cornerRadius: 22, style: .continuous).fill(Self.card.opacity(0.97)))
+        .overlay(RoundedRectangle(cornerRadius: 22, style: .continuous).stroke(Self.stroke, lineWidth: 1))
+        .animation(.spring(response: 0.34, dampingFraction: 0.86), value: sheetExpanded)
+        .animation(.spring(response: 0.34, dampingFraction: 0.86), value: hasHomeContent)
+    }
+
+    private func setSheet(_ v: Bool) {
+        withAnimation(.spring(response: 0.34, dampingFraction: 0.86)) { sheetExpanded = v }
+    }
+
+    private func toggleSheet() {
+        withAnimation(.spring(response: 0.34, dampingFraction: 0.86)) { sheetExpanded.toggle() }
+    }
+
+    /// 高德 / 苹果地图分享内容的手动兜底入口（自动导入仍走 URL Scheme / 通知）
+    private var shareImportCard: some View {
+        CardView {
+            Button { pasteShare() } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "doc.on.clipboard")
+                    Text(shareBusy ? "正在读取分享内容…" : "粘贴分享的路线 / 地点")
+                    Spacer()
+                }
+                .font(.subheadline).foregroundColor(Color.orange)
+            }
+            .disabled(shareBusy)
+        }
+    }
+
+    /// 摩托车 / 自行车路线规划
+    private var routeModeButtons: some View {
+        CardView {
+            Text("路线规划").foregroundColor(.white).bold()
+            HStack(spacing: 12) {
+                Button {
+                    if !independent.running { independent.arrived = false }
+                    independentMode = .motorcycle
+                    showWebMotor = true
+                } label: {
+                    Label("摩托车路线规划", systemImage: "flag.fill")
+                        .font(.subheadline).foregroundColor(.white)
+                        .frame(maxWidth: .infinity, minHeight: 44)
+                        .background(RoundedRectangle(cornerRadius: 12).fill(Self.pink.opacity(0.85)))
+                }
+                Button {
+                    if !independent.running { independent.arrived = false }
+                    independentMode = .bicycle
+                    showWebMotor = true
+                } label: {
+                    Label("自行车路线规划", systemImage: "bicycle")
+                        .font(.subheadline).foregroundColor(.white)
+                        .frame(maxWidth: .infinity, minHeight: 44)
+                        .background(RoundedRectangle(cornerRadius: 12).fill(Self.cyan.opacity(0.8)))
+                }
+            }
+        }
+    }
+
+    /// 骑行轨迹
+    private var ridesCard: some View {
+        CardView {
+            Button { showRides = true } label: {
+                HStack {
+                    Image(systemName: "map").foregroundColor(Self.cyan)
+                    Text("骑行轨迹").foregroundColor(Self.cyan)
+                    Spacer()
+                    Image(systemName: "chevron.right").foregroundColor(Self.sub)
+                }
+            }
+        }
     }
 
     // MARK: 巡航
@@ -768,4 +898,27 @@ struct PillButton: View {
 /// 收起键盘
 func hideKeyboard() {
     UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+}
+
+// MARK: - 首页底图：高德地图，跟随定位
+/// 复用工程里已有的高德 SDK（MAMapView 由 Bridging Header 引入），不新增依赖、不改 pbxproj。
+struct HomeMapView: UIViewRepresentable {
+    let night: Bool
+
+    func makeUIView(context: Context) -> MAMapView {
+        let map = MAMapView(frame: .zero)
+        map.mapType = night ? .standardNight : .standard
+        map.showsCompass = false
+        map.showsUserLocation = true
+        if let p = NaviBridge.shared.myPosition() {
+            map.setCenter(CLLocationCoordinate2D(latitude: p.lat, longitude: p.lng), animated: false)
+        }
+        map.zoomLevel = 16
+        map.userTrackingMode = .follow
+        return map
+    }
+
+    func updateUIView(_ map: MAMapView, context: Context) {
+        map.mapType = night ? .standardNight : .standard
+    }
 }
