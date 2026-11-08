@@ -582,3 +582,258 @@ final class ShareGuide {
         if ourCalc { NaviBridge.shared.setRerouting(true) }       // 圆屏继续显示“重新规划中”
     }
 }
+
+
+// MARK: - 分享「地点」解析（v2 新增，追加在原文件末尾，不需要改 project.pbxproj）
+//
+// 原来的 AmapShare 只认「路线分享」（shareParam / __r= / saddr+daddr），
+// 高德分享一个 POI、苹果地图分享一个地点，都会被挡在门外。
+// 这里补齐：把任意分享文本解析成一个目的地（GCJ-02 坐标），交给 NaviBridge.plan。
+//
+// 支持：
+//   · 高德地点：uri.amap.com/marker?position=经度,纬度&name=…、surl.amap.com 短链、
+//     www.amap.com/place/…、m.amap.com 详情、amapuri://、以及文本里的经纬度
+//   · 高德路线分享（高德网页接口改版导致原样还原失败时，降级为「按终点导航」）：
+//     daddr=、dlat/dlon、__r= 里的终点经纬度
+//   · 苹果地图：maps.apple.com/?q=名称&ll=纬度,经度、
+//     maps.apple.com/place?coordinate=纬度,经度&name=…、daddr=
+//   · Google 地图 / geo: 链接、纯文本里的「经度,纬度」
+//   · 只有地名没有坐标 → 交给高德输入提示搜索（主 App 自动选第一条）
+//
+// 坐标系：高德系 GCJ-02 直接用；Apple / Google / geo 的 WGS-84 用 MapGeo.wgsToGcj 转换，
+// 否则在中国大陆会偏 300~600 米。
+enum SharePlace {
+    struct Place {
+        let name: String
+        let lat: Double                     // GCJ-02，可直接给高德 SDK
+        let lng: Double
+        let source: String
+    }
+
+    enum Resolution {
+        case place(Place)
+        case needSearch(String)             // 只解析出名字，需要走高德搜索
+        case none
+    }
+
+    /// 和 MotoNavShare/ShareViewController.swift 的 inboxTag 一致
+    static let inboxTag = "MOTONAVSHARE|"
+
+    private static let UA = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+
+    /// 去掉分享扩展写在剪贴板里的标记
+    static func strip(_ raw: String) -> String {
+        var t = raw
+        if let r = t.range(of: inboxTag) { t = String(t[r.upperBound...]) }
+        return t.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// 同步解析，会发网络请求跟随短链 —— 必须在后台队列调用
+    static func resolve(_ raw: String) -> Resolution {
+        let text = strip(raw)
+        guard !text.isEmpty else { return .none }
+
+        let urls = extractURLs(text)
+        var candidates: [String] = urls
+        // 只有看不出坐标的短链才去跟随跳转，省掉不必要的网络等待
+        for u in urls.prefix(3) where !hasCoordHint(u) {
+            for e in expand(u) where !candidates.contains(e) { candidates.append(e) }
+        }
+
+        for u in candidates {
+            if let p = parseURL(u, fullText: text) { return .place(p) }
+        }
+        if let p = parseRouteText(text) { return .place(p) }
+        if let p = parseTextCoords(text) { return .place(p) }
+        if let n = guessName(text) { return .needSearch(n) }
+        return .none
+    }
+
+    // MARK: URL 收集 / 短链展开
+
+    private static func extractURLs(_ s: String) -> [String] {
+        guard let re = try? NSRegularExpression(pattern: #"(?:https?://|geo:|maps:|amapuri://|iosamap://|androidamap://)[^\s，。、"'<>（）)】]+"#) else { return [] }
+        let ns = s as NSString
+        return re.matches(in: s, range: NSRange(location: 0, length: ns.length)).map { ns.substring(with: $0.range) }
+    }
+
+    private static func hasCoordHint(_ u: String) -> Bool {
+        for k in ["ll=", "position=", "coordinate=", "center=", "daddr=", "dlat=", "saddr=", "q=", "/@"] {
+            if u.contains(k) { return true }
+        }
+        return false
+    }
+
+    /// URLSession 默认会跟随 302，response.url 就是最终地址；JS 跳转再从 HTML 里捞一次
+    private static func expand(_ start: String) -> [String] {
+        var chain = [start]
+        var cur = start
+        for _ in 0..<4 {
+            guard let u = URL(string: cur), let sch = u.scheme?.lowercased(), sch.hasPrefix("http") else { break }
+            var req = URLRequest(url: u)
+            req.httpMethod = "GET"
+            req.timeoutInterval = 6
+            req.setValue(UA, forHTTPHeaderField: "User-Agent")
+            let sem = DispatchSemaphore(value: 0)
+            var finalURL: String?, body: String?
+            URLSession.shared.dataTask(with: req) { d, r, _ in
+                finalURL = r?.url?.absoluteString
+                if let d = d, d.count < 400_000 { body = String(data: d, encoding: .utf8) }
+                sem.signal()
+            }.resume()
+            if sem.wait(timeout: .now() + 7) == .timedOut { break }
+            var next = finalURL
+            if (next == nil || next == cur), let b = body { next = firstMapURL(in: b) }
+            guard let n = next, n != cur, !chain.contains(n) else { break }
+            chain.append(n)
+            cur = n
+        }
+        return chain
+    }
+
+    private static func firstMapURL(in body: String) -> String? {
+        guard let re = try? NSRegularExpression(pattern: #"https?://[^"'\s<>\\]*(?:amap\.com|maps\.apple\.com)[^"'\s<>\\]*"#) else { return nil }
+        let ns = body as NSString
+        guard let m = re.firstMatch(in: body, range: NSRange(location: 0, length: ns.length)) else { return nil }
+        return ns.substring(with: m.range)
+    }
+
+    // MARK: 从一个 URL 里取坐标 + 名字
+
+    private static func parseURL(_ u: String, fullText: String) -> Place? {
+        guard let c = URLComponents(string: u) else { return nil }
+        let host = (c.host ?? "").lowercased()
+        let path = c.path
+        var q: [String: String] = [:]
+        for item in c.queryItems ?? [] { if let v = item.value { q[item.name.lowercased()] = v } }
+
+        let isAmap = host.contains("amap.com") || u.hasPrefix("amapuri") || u.hasPrefix("iosamap") || u.hasPrefix("androidamap")
+        let isWGS = host.contains("apple.com") || host.contains("google") || host.contains("goo.gl")
+            || host.contains("openstreetmap") || host.contains("bing.com") || u.lowercased().hasPrefix("geo:")
+        let defOrder: Order = isAmap ? .lonLat : .latLng      // 高德是「经度,纬度」，Apple/Google 是「纬度,经度」
+
+        var coord: (lat: Double, lng: Double)?
+
+        if u.lowercased().hasPrefix("geo:") { coord = pair(path, order: .latLng) }
+        // 路线分享优先拿「终点」，别一不小心拿起点去导航
+        if coord == nil, let v = q["daddr"] { coord = pair(v, order: defOrder) }
+        if coord == nil, let la = q["dlat"].flatMap(Double.init), let lo = q["dlon"].flatMap(Double.init),
+           la >= -90, la <= 90, lo >= -180, lo <= 180 { coord = (la, lo) }
+        if coord == nil, let e = routeEnd(u) { coord = (e.lat, e.lng) }
+        // 地点分享的各种参数
+        if coord == nil, let v = q["position"] { coord = pair(v, order: .lonLat) }
+        if coord == nil, let v = q["location"] { coord = pair(v, order: .lonLat) }
+        if coord == nil, let v = q["ll"] { coord = pair(v, order: .latLng) }
+        if coord == nil, let v = q["coordinate"] { coord = pair(v, order: .latLng) }
+        if coord == nil, let v = q["center"] { coord = pair(v, order: .latLng) }
+        if coord == nil, let v = q["sll"] { coord = pair(v, order: .latLng) }
+        if coord == nil, let v = q["q"] { coord = pair(v, order: .auto) }
+        if coord == nil, let la = q["lat"].flatMap(Double.init), let lo = (q["lng"] ?? q["lon"]).flatMap(Double.init) { coord = (la, lo) }
+        if coord == nil, let la = q["latitude"].flatMap(Double.init), let lo = q["longitude"].flatMap(Double.init) { coord = (la, lo) }
+        if coord == nil, let v = q["p"] { coord = pair(v, order: .lonLat) }
+        if coord == nil { coord = pair(atSignIn(path), order: .latLng) }
+        if coord == nil, let v = q["near"] { coord = pair(v, order: .latLng) }
+        if coord == nil, let v = q["saddr"] { coord = pair(v, order: defOrder) }   // 最后兜底
+        guard var c2 = coord else { return nil }
+
+        var name = ""
+        for k in ["name", "poiname", "dname", "title", "query", "q"] {
+            if let v = q[k], !v.isEmpty, isName(v) { name = v; break }
+        }
+        if name.isEmpty, let e = routeEnd(u), !e.name.isEmpty { name = e.name }
+        if name.isEmpty { name = guessName(fullText) ?? "" }
+
+        if isWGS {                                    // WGS-84 → GCJ-02，高德 SDK 用火星坐标
+            let g = MapGeo.wgsToGcj(c2.lat, c2.lng)
+            c2 = (g.lat, g.lng)
+        }
+        let source: String
+        if isAmap { source = "高德地图" }
+        else if host.contains("apple.com") { source = "苹果地图" }
+        else if host.contains("google") { source = "Google 地图" }
+        else { source = "分享链接" }
+        return Place(name: name.isEmpty ? "分享的地点" : name, lat: c2.lat, lng: c2.lng, source: source)
+    }
+
+    private enum Order { case lonLat, latLng, auto }
+
+    private static func pair(_ s: String, order: Order) -> (lat: Double, lng: Double)? {
+        let parts = s.trimmingCharacters(in: .whitespacesAndNewlines)
+            .components(separatedBy: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+        guard parts.count >= 2, let a = Double(parts[0]), let b = Double(parts[1]), a.isFinite, b.isFinite else { return nil }
+        func ok(_ lat: Double, _ lng: Double) -> Bool { lat >= -90 && lat <= 90 && lng >= -180 && lng <= 180 }
+        switch order {
+        case .lonLat: return ok(b, a) ? (b, a) : nil
+        case .latLng: return ok(a, b) ? (a, b) : nil
+        case .auto:
+            if a > 90 && b < 60 { return (b, a) }             // 中国：经度 100+ 在前
+            if b > 90 && a < 60 { return (a, b) }             // 纬度在前
+            if ok(a, b) { return (a, b) }
+            if ok(b, a) { return (b, a) }
+            return nil
+        }
+    }
+
+    private static func isName(_ v: String) -> Bool {
+        pair(v, order: .auto) == nil
+    }
+
+    private static func atSignIn(_ path: String) -> String {
+        guard let r = path.range(of: #"@(-?\d+\.\d+),(-?\d+\.\d+)"#, options: .regularExpression) else { return "" }
+        return String(path[r]).replacingOccurrences(of: "@", with: "")
+    }
+
+    /// 高德路线分享里的 __r=起点纬度,经度,名字,终点纬度,经度,名字,…
+    private static func routeEnd(_ s: String) -> (lat: Double, lng: Double, name: String)? {
+        guard let re = try? NSRegularExpression(pattern: #"(?:__r|[?&]r)=([^&"'\s<>]+)"#) else { return nil }
+        let ns = s as NSString
+        guard let m = re.firstMatch(in: s, range: NSRange(location: 0, length: ns.length)), m.numberOfRanges > 1 else { return nil }
+        var v = ns.substring(with: m.range(at: 1))
+        for _ in 0..<3 { let d = v.removingPercentEncoding ?? v; if d == v { break }; v = d }
+        let f = v.components(separatedBy: ",")
+        guard f.count >= 6, let la = Double(f[3]), let lo = Double(f[4]),
+              la >= -90, la <= 90, lo >= -180, lo <= 180 else { return nil }
+        return (la, lo, f[5])
+    }
+
+    /// 整段文本里找高德路线终点（URL 被截断、只剩文本时也能用）
+    private static func parseRouteText(_ text: String) -> Place? {
+        guard let e = routeEnd(text) else { return nil }
+        return Place(name: e.name.isEmpty ? (guessName(text) ?? "分享的目的地") : e.name,
+                     lat: e.lat, lng: e.lng, source: "高德分享路线的终点")
+    }
+
+    /// 文本里散落的经纬度：39.993253,116.473195 或 116.473195,39.993253
+    private static func parseTextCoords(_ text: String) -> Place? {
+        guard let re = try? NSRegularExpression(pattern: #"(?<![\d.])(\d{2,3}\.\d{4,})\s*[,，\s]\s*(\d{2,3}\.\d{4,})(?![\d.])"#) else { return nil }
+        let ns = text as NSString
+        for m in re.matches(in: text, range: NSRange(location: 0, length: ns.length)) {
+            guard let a = Double(ns.substring(with: m.range(at: 1))),
+                  let b = Double(ns.substring(with: m.range(at: 2))),
+                  let c = pair("\(a),\(b)", order: .auto) else { continue }
+            return Place(name: guessName(text) ?? "分享的地点", lat: c.lat, lng: c.lng, source: "分享文本坐标")
+        }
+        return nil
+    }
+
+    /// 从分享文案里挑一个能当搜索关键词的名字
+    private static func guessName(_ text: String) -> String? {
+        let trimSet = CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: "【】[]·:：-—,，。 "))
+        let lines = text.components(separatedBy: .newlines).map { line -> String in
+            var s = line
+            if let re = try? NSRegularExpression(pattern: #"(?:https?://|geo:|amapuri://)\S+"#) {
+                let ns = s as NSString
+                s = re.stringByReplacingMatches(in: s, range: NSRange(location: 0, length: ns.length), withTemplate: "")
+            }
+            return s.trimmingCharacters(in: trimSet)
+        }
+        let skip = ["我在高德地图", "高德地图", "苹果地图", "分享给你", "点击查看", "复制链接",
+                    "打开链接", "我在这里", "位置分享", "来自高德地图", "查看详情"]
+        for l in lines where l.count >= 2 && l.count <= 40 {
+            if skip.contains(where: { l == $0 }) { continue }
+            if l.range(of: #"^[\d\.,\s\-:：]+$"#, options: .regularExpression) != nil { continue }
+            return l
+        }
+        return nil
+    }
+}

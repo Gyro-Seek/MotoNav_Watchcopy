@@ -1,6 +1,7 @@
 import SwiftUI
 import CoreLocation
 import AVFoundation
+import Combine
 
 /// 版本：跟随 App 版本（见 Config.swift）
 ///
@@ -32,6 +33,8 @@ struct ContentView: View {
     private static var keyPrompted = false              // 这次打开 App 已经提醒过填 key 了
     @State private var shareBusy = false
     @State private var shareStatus = ""
+    @State private var autoStartNavi = false        // 分享进来的地点：路线算好就自动开始导航
+    @State private var autoPickResult = false       // 只有地名时：搜索结果回来自动选第一条
     @State private var cruiseNote = ""
     @State private var addingVia = false               // 正在搜途经点
 
@@ -91,11 +94,24 @@ struct ContentView: View {
                 showKeys = true
             }
         }
-        .onOpenURL { url in                            // iOS v0.4 高德里“分享到 MotoNav”：motonav://share?t=分享的文字
+        .onOpenURL { url in                            // 高德 / 苹果地图「分享到 MotoNav」：motonav://share?t=分享的文字
             guard url.scheme == "motonav",
                   let t = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first(where: { $0.name == "t" })?.value
             else { return }
-            importShare(t)
+            handleShare(t)
+        }
+        // 只解析出地名时，等搜索结果回来自动选第一条（见 importPlaceShare）
+        .onReceive(search.$results) { rs in
+            guard autoPickResult, !rs.isEmpty else { return }
+            autoPickResult = false
+            choose(rs[0])
+        }
+        // 分享进来的地点 / 路线：规划完成立刻开始导航，不用再手点「开始导航」
+        .onChange(of: navi.routeReady) { ready in
+            guard ready, autoStartNavi else { return }
+            autoStartNavi = false
+            navi.start(emulate: false)
+            showNavi = true
         }
     }
 
@@ -182,12 +198,12 @@ struct ContentView: View {
             Button { pasteShare() } label: {
                 HStack(spacing: 6) {
                     Image(systemName: "doc.on.clipboard")
-                    Text(shareBusy ? "正在读取分享的路线…" : "粘贴高德分享的路线")
+                    Text(shareBusy ? "正在读取分享内容…" : "粘贴分享的路线 / 地点")
                 }
                 .font(.subheadline).foregroundColor(Color.orange)
             }
             .disabled(shareBusy)
-            Text("在高德里规划好路线 → 分享 → 选 MotoNav；或者复制链接后点上面这行").font(.caption2).foregroundColor(ContentView.sub)
+            Text("高德路线、高德地点、苹果地图地点都行：地图里点分享 → 选 MotoNav；系统没跳转时点上面这行").font(.caption2).foregroundColor(ContentView.sub)
             }
             if !shareStatus.isEmpty { Text(shareStatus).font(.footnote).foregroundColor(ContentView.sub) }
             if !search.status.isEmpty { Text(search.status).font(.footnote).foregroundColor(ContentView.sub) }
@@ -337,28 +353,51 @@ struct ContentView: View {
         navi.plan(toLat: p.lat, lng: p.lng)
     }
 
-    /// 读剪贴板里的高德分享链接，还原路线后按它规划
+    /// 读剪贴板（分享扩展打不开主 App 时会把内容暂存到这里）
     private func pasteShare() {
-        guard let t = UIPasteboard.general.string, AmapShare.findUrl(t) != nil else {
-            shareStatus = "剪贴板里没有高德的分享链接：先在高德里打开路线 → 分享 → 复制链接"
+        guard let raw = UIPasteboard.general.string, !raw.isEmpty else {
+            shareStatus = "剪贴板是空的：先在地图 App 里点分享 → 选 MotoNav，或复制分享内容"
             return
         }
-        importShare(t)
+        let t = SharePlace.strip(raw)
+        guard !t.isEmpty else { shareStatus = "剪贴板里没有分享内容"; return }
+        if raw.hasPrefix(SharePlace.inboxTag) { UIPasteboard.general.string = "" }   // 消费掉标记，避免重复导入
+        handleShare(t)
     }
 
-    /// 导入高德分享的路线（剪贴板粘贴，或者从高德“分享到 MotoNav”过来）
-    private func importShare(_ t: String) {
-        guard AmapShare.findUrl(t) != nil else { shareStatus = "分享的内容里没有高德链接"; return }
-        if navi.navigating || WebMotorSession.shared.running { shareStatus = "正在导航：先退出导航，再导入分享的路线"; return }
+    /// 分享统一入口：URL Scheme（onOpenURL）和剪贴板兜底都走这里
+    private func handleShare(_ raw: String) {
+        let t = SharePlace.strip(raw)
+        guard !t.isEmpty else { shareStatus = "分享内容为空"; return }
+        if navi.navigating || WebMotorSession.shared.running {
+            shareStatus = "正在导航：先退出导航，再导入分享内容"
+            return
+        }
         addingVia = false
         hideKeyboard()
+        search.clear()
+
+        // 只有高德「路线分享」才走原来的整条路线还原；高德地点分享直接按地点处理
+        let looksLikeRoute = t.contains("shareParam") || t.contains("__r=") || t.contains("/navigation/")
+            || t.contains("daddr=") || t.contains("saddr=") || t.contains("路线")
+        if AmapShare.findUrl(t) != nil && looksLikeRoute {
+            importRouteShare(t)
+        } else {
+            importPlaceShare(t)
+        }
+    }
+
+    /// 原来的高德路线还原。高德网页内部接口一改版就会失效，这里失败自动降级成「按分享里的终点导航」
+    private func importRouteShare(_ t: String) {
         shareBusy = true
         shareStatus = "正在读取高德分享的路线…"
         DispatchQueue.global(qos: .userInitiated).async {
             let res = Result { try AmapShare.load(t) }
             DispatchQueue.main.async {
                 shareBusy = false
-                guard !navi.navigating, !WebMotorSession.shared.running else { shareStatus = "导航已开始，请结束后重新导入"; return }
+                guard !navi.navigating, !WebMotorSession.shared.running else {
+                    shareStatus = "导航已开始，请结束后重新导入"; return
+                }
                 switch res {
                 case .success(let r):
                     shareStatus = "已读取：\(r.kind)路线 \(NaviBridge.distText(r.distance > 0 ? r.distance : Int(r.total)))" +
@@ -374,12 +413,59 @@ struct ContentView: View {
                         WebMotorSession.shared.route = MotorRoutes.fromShare(r)
                         independentMode = .bicycle
                         showWebMotor = true
-                    } else if !needAmapKey() { navi.plan(toLat: r.endLat, lng: r.endLng, share: r) }
+                    } else if !needAmapKey() {
+                        autoStartNavi = true
+                        navi.plan(toLat: r.endLat, lng: r.endLng, share: r)
+                    }
                 case .failure(let e):
-                    shareStatus = "读取失败：\(e.localizedDescription)"
+                    shareStatus = "高德路线还原失败（\(e.localizedDescription)），改用分享里的终点直接导航…"
+                    importPlaceShare(t)
                 }
             }
         }
+    }
+
+    /// 地点分享：解析 → 设目的地 → 规划 → 算好自动开始导航
+    private func importPlaceShare(_ t: String) {
+        shareBusy = true
+        shareStatus = "正在识别分享的地点…"
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result = SharePlace.resolve(t)
+            DispatchQueue.main.async {
+                shareBusy = false
+                guard !navi.navigating, !WebMotorSession.shared.running else {
+                    shareStatus = "导航已开始，请结束后重新导入"; return
+                }
+                switch result {
+                case .place(let p):
+                    applyPlace(p)
+                case .needSearch(let name):
+                    query = name
+                    shareStatus = "分享里只有地名「\(name)」，正在用高德搜索…"
+                    guard !needAmapKey() else { return }
+                    autoPickResult = true
+                    autoStartNavi = true
+                    search.search(name)
+                case .none:
+                    shareStatus = "没认出分享内容里的地点。请在地图里点「分享」→「MotoNav」，或复制含链接 / 经纬度的文本后重试"
+                }
+            }
+        }
+    }
+
+    /// 拿到 GCJ-02 坐标后设置目的地；routeReady 变 true 时会自动开始导航
+    private func applyPlace(_ p: SharePlace.Place) {
+        let place = SearchService.Place(name: p.name, address: "来自\(p.source)分享", lat: p.lat, lng: p.lng)
+        dest = place
+        query = p.name
+        search.clear()
+        History.shared.add(place)
+        shareStatus = "已收到\(p.source)分享的地点：\(p.name)（\(String(format: "%.5f", p.lat)), \(String(format: "%.5f", p.lng))），正在规划…"
+        guard !needAmapKey() else { return }
+        autoStartNavi = true
+        // 规划失败时别让这个标记一直挂着，避免以后手动规划也被强制自动开始
+        DispatchQueue.main.asyncAfter(deadline: .now() + 30) { if autoStartNavi { autoStartNavi = false } }
+        navi.plan(toLat: p.lat, lng: p.lng)
     }
 
     // MARK: 巡航
