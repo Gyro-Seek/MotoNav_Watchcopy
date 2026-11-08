@@ -2,6 +2,7 @@ import SwiftUI
 import CoreLocation
 import AVFoundation
 import Combine
+import ObjectiveC
 
 /// 版本：跟随 App 版本（见 Config.swift）
 ///
@@ -40,6 +41,14 @@ struct ContentView: View {
     @Environment(\.scenePhase) private var scenePhase
     @State private var lastHandledShare = ""        // 去重：onOpenURL 和前台自动消费可能同时到
     @State private var sheetExpanded = false         // 首页底部搜索抽屉：上滑展开更多入口
+    @State private var homeStage: HomeStage = .idle  // 首页流程：搜索 → 地点 → 路线
+    @State private var homeFocus: CLLocationCoordinate2D? = nil   // 选中的地点（地图相机目标）
+    @State private var focusToken = 0                  // 每选一次地点 +1，触发地图定位
+    @State private var recenterToken = 0               // 右下角「回到定位」按钮
+    @State private var overviewToken = 0               // 路线算好后自动缩放到全路线
+    @State private var pendingSearchSubmit = false     // 按了「搜索」但结果还没回来
+    @State private var suppressAutoSearch = false      // 程序化改 query 时不触发实时检索
+    @State private var searchWork: DispatchWorkItem? = nil
 
     static let bg = Color(red: 0.055, green: 0.04, blue: 0.08)
     static let card = Color(red: 0.10, green: 0.08, blue: 0.14)
@@ -94,10 +103,22 @@ struct ContentView: View {
                 showKeys = true
             }
             // 冷启动时通知可能比界面先到，补一次
+            suppressAutoSearch = false
             flushPendingShare()
         }
         .onChange(of: scenePhase) { phase in
             if phase == .active { flushPendingShare() }
+        }
+        // 输入即检索：350ms 防抖，SearchService 自带关键词缓存，避免每个字母都请求高德
+        .onChange(of: query) { t in
+            guard !suppressAutoSearch else { suppressAutoSearch = false; return }
+            if homeStage != .idle { backToSearch() }
+            scheduleAutoSearch(t)
+        }
+        // 路线算好后自动把地图缩放到能看全所有路线
+        .onChange(of: navi.routeOptions.count) { n in
+            guard homeStage == .routes, n > 0 else { return }
+            overviewToken += 1
         }
         // 用户点了分享扩展发的本地通知：内容直接随通知带过来，不用读剪贴板
         .onReceive(NotificationCenter.default.publisher(for: AppDelegate.shareNotification)) { note in
@@ -110,11 +131,18 @@ struct ContentView: View {
             else { return }
             deliverShare(t)
         }
-        // 只解析出地名时，等搜索结果回来自动选第一条（见 importPlaceShare）
+        // 只解析出地名时，等搜索结果回来自动选第一条（见 importPlaceShare）；
+        // 手动按「搜索」但结果还没回来时，回来后也直接选中第一条
         .onReceive(search.$results) { rs in
-            guard autoPickResult, !rs.isEmpty else { return }
-            autoPickResult = false
-            choose(rs[0])
+            if autoPickResult, !rs.isEmpty {
+                autoPickResult = false
+                choose(rs[0], autoPlan: true)
+                return
+            }
+            if pendingSearchSubmit, let first = rs.first {
+                pendingSearchSubmit = false
+                choose(first)
+            }
         }
         // 分享进来的地点 / 路线：规划完成立刻开始导航，不用再手点「开始导航」
         .onChange(of: navi.routeReady) { ready in
@@ -191,145 +219,216 @@ struct ContentView: View {
                 .textFieldStyle(.plain)
                 .foregroundColor(.white)
                 .submitLabel(.search)
-                .onSubmit { if !needAmapKey() { search.search(query) } }
-                .onChange(of: query) { if $0.isEmpty { search.clear() } }
-            Button("搜索") { hideKeyboard(); if !needAmapKey() { search.search(query) } }
-                .font(.subheadline.bold())
-                .foregroundColor(.white)
-                .padding(.horizontal, 14).padding(.vertical, 9)
-                .background(RoundedRectangle(cornerRadius: 10).fill(Self.pink))
+                .onSubmit { submitSearch() }
+            if !query.isEmpty || homeStage != .idle {
+                Button { resetHome() } label: {
+                    Image(systemName: "xmark.circle.fill").foregroundColor(Self.sub)
+                }
+            }
+            Button { submitSearch() } label: {
+                Text("搜索").font(.subheadline.bold()).foregroundColor(.white)
+                    .padding(.horizontal, 14).padding(.vertical, 9)
+                    .background(RoundedRectangle(cornerRadius: 10).fill(Self.pink))
+            }
         }
         .padding(.horizontal, 12).padding(.vertical, 9)
         .background(RoundedRectangle(cornerRadius: 15).fill(Self.bg))
     }
 
-    // MARK: 去哪儿（搜索结果 / 目的地 / 路线，放在抽屉里）
-    /// 抽屉里是否有内容可展示。为 false 时整张卡片都不渲染，
-    /// 免得收起态留下一个只有边框和背景的空白「文字框」。
-    private var hasHomeContent: Bool {
-        !shareStatus.isEmpty || !search.status.isEmpty || !search.results.isEmpty
-            || dest != nil
-            || (search.results.isEmpty && (dest == nil || addingVia) && !history.places.isEmpty)
+    // MARK: 首页抽屉内容：按「搜索 / 地点 / 路线」三个阶段切换
+
+    /// 搜索态有没有内容要展示（决定空闲时抽屉的高度）
+    private var hasSearchContent: Bool {
+        !search.results.isEmpty || !search.status.isEmpty || !shareStatus.isEmpty
+            || (!history.places.isEmpty && query.isEmpty)
     }
 
+    /// 搜索态：实时检索结果 / 最近去过
     @ViewBuilder
-    private var homeDestSection: some View {
-        if hasHomeContent {
-        CardView {
-            if !shareStatus.isEmpty { Text(shareStatus).font(.footnote).foregroundColor(ContentView.sub) }
-            if !search.status.isEmpty { Text(search.status).font(.footnote).foregroundColor(ContentView.sub) }
-            ForEach(search.results.prefix(8)) { p in
+    private var searchResultSection: some View {
+        if !shareStatus.isEmpty { Text(shareStatus).font(.footnote).foregroundColor(ContentView.sub) }
+        if !search.status.isEmpty { Text(search.status).font(.footnote).foregroundColor(ContentView.sub) }
+        if shareBusy { Text("正在识别分享内容…").font(.footnote).foregroundColor(ContentView.sub) }
+        ForEach(search.results.prefix(8)) { p in
+            Button { choose(p) } label: {
+                HStack(alignment: .center, spacing: 8) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(p.name).foregroundColor(.white)
+                        Text(p.address).font(.caption).foregroundColor(ContentView.sub).lineLimit(1)
+                    }
+                    Spacer(minLength: 4)
+                    if let d = distanceTo(p) { Text(d).font(.caption).foregroundColor(ContentView.cyan) }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.vertical, 6)
+            }
+            Divider().background(ContentView.stroke)
+        }
+        if search.results.isEmpty && query.isEmpty && !history.places.isEmpty {
+            Text(addingVia ? "从最近去过里选途经点" : "最近去过").font(.caption).foregroundColor(ContentView.sub)
+            ForEach(history.places.prefix(8)) { p in
                 Button { choose(p) } label: {
                     HStack(alignment: .center, spacing: 8) {
                         VStack(alignment: .leading, spacing: 2) {
                             Text(p.name).foregroundColor(.white)
-                            Text(p.address).font(.caption).foregroundColor(ContentView.sub).lineLimit(1)
+                            if !p.address.isEmpty { Text(p.address).font(.caption).foregroundColor(ContentView.sub).lineLimit(1) }
                         }
                         Spacer(minLength: 4)
                         if let d = distanceTo(p) { Text(d).font(.caption).foregroundColor(ContentView.cyan) }
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.vertical, 6)
+                    .padding(.vertical, 4)
                 }
                 Divider().background(ContentView.stroke)
             }
-            // iOS v0.4 最近去过（还没选目的地、或者正在选途经点时显示）
-            if search.results.isEmpty && (dest == nil || addingVia) && !history.places.isEmpty {
-                Text(addingVia ? "从最近去过里选途经点" : "最近去过").font(.caption).foregroundColor(ContentView.sub).padding(.top, 4)
-                ForEach(history.places.prefix(8)) { p in
-                    Button { choose(p) } label: {
-                        HStack(alignment: .center, spacing: 8) {
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(p.name).foregroundColor(.white)
-                                if !p.address.isEmpty { Text(p.address).font(.caption).foregroundColor(ContentView.sub).lineLimit(1) }
-                            }
-                            Spacer(minLength: 4)
-                            if let d = distanceTo(p) { Text(d).font(.caption).foregroundColor(ContentView.cyan) }
-                        }
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.vertical, 4)
-                    }
-                    Divider().background(ContentView.stroke)
-                }
-                Button("清除记录") { history.clear() }.font(.caption).foregroundColor(ContentView.sub)
-            }
+            Button("清除记录") { history.clear() }.font(.caption).foregroundColor(ContentView.sub)
+        }
+    }
+
+    /// 地点态：地名 + 地址 + 「路线」按钮（点路线才开始算路）
+    private var placeCard: some View {
+        CardView {
             if let d = dest {
-                HStack {
-                    Text("目的地：\(d.name)").font(.footnote).foregroundColor(.white)
-                    Button("收藏") { favorites.add(d) }.foregroundColor(Self.cyan)
+                Text(d.name).foregroundColor(.white).bold().lineLimit(2)
+                if !d.address.isEmpty { Text(d.address).font(.caption).foregroundColor(ContentView.sub).lineLimit(2) }
+                HStack(spacing: 12) {
+                    Button { favorites.add(d) } label: {
+                        Label("收藏", systemImage: "star").font(.subheadline).foregroundColor(ContentView.cyan)
+                    }
                     Spacer()
-                    if !navi.navigating {
-                        Button("换目的地") {
-                            dest = nil; query = ""; addingVia = false; shareStatus = ""
-                            search.clear()
-                            navi.clearPlan()
-                        }
-                        .font(.caption).foregroundColor(ContentView.cyan)
+                    Button("取消") { resetHome() }.font(.subheadline).foregroundColor(ContentView.sub)
+                    Button { startRoutePlanning() } label: {
+                        Text("路线").font(.headline).foregroundColor(.white)
+                            .frame(width: 108, minHeight: 44)
+                            .background(Capsule().fill(ContentView.pink))
                     }
                 }
-                if let sr = navi.shareRoute {
-                    Text("按高德分享的\(sr.kind)路线走（原路线 \(NaviBridge.distText(Int(sr.total)))）").font(.caption).foregroundColor(Color.orange)
-                    if !navi.shareMatch.isEmpty { Text(navi.shareMatch).font(.caption).foregroundColor(ContentView.sub) }
-                }
-                if navi.shareRoute == nil {                 // 途经点（分享的路线自带途经点）
-                    HStack(spacing: 12) {
-                        Text(navi.vias.isEmpty ? "途经：无" : "途经：" + navi.vias.map { $0.name }.joined(separator: " → "))
-                            .font(.caption).foregroundColor(ContentView.sub).lineLimit(2)
-                        Spacer()
-                        if addingVia {
-                            Button("取消") { addingVia = false; query = d.name; search.clear() }
-                                .font(.caption).foregroundColor(ContentView.sub)
-                        } else {
-                            Button("+ 途经点") { addingVia = true; query = ""; search.clear() }
-                                .font(.caption).foregroundColor(navi.vias.count >= 3 ? ContentView.sub : ContentView.cyan)
-                                .disabled(navi.vias.count >= 3)
-                            if !navi.vias.isEmpty {
-                                Button("清除") { navi.clearVias() }.font(.caption).foregroundColor(ContentView.sub)
-                            }
-                        }
-                    }
-                    if addingVia {
-                        Text("在上面搜索途经点（比如加油站），或者从最近去过里选；最多 3 个，按顺序经过")
-                            .font(.caption2).foregroundColor(Color.orange)
-                    }
-                }
-                Toggle("不走高速", isOn: $settings.avoidHighway)
-                    .foregroundColor(.white).tint(ContentView.pink)
-                    .onChange(of: settings.avoidHighway) { _ in navi.replan() }
-                if navi.calculating || navi.routeOptions.isEmpty {
-                    Text(navi.calculating ? "正在规划路线…" : navi.info).font(.footnote).foregroundColor(ContentView.sub)
-                }
-                if navi.planFailed && !navi.calculating {   // iOS v0.6 规划失败 / 超时
-                    Button { navi.replan() } label: {
-                        Label("重新规划", systemImage: "arrow.clockwise").font(.subheadline.bold()).foregroundColor(ContentView.cyan)
-                    }
-                }
-                if !navi.routeOptions.isEmpty {
-                    RouteMapView(routes: navi.routeOptions, selected: navi.selectedRouteID,
-                                 ghost: navi.shareRoute?.pts.map { CLLocationCoordinate2D(latitude: $0.lat, longitude: $0.lng) } ?? [],
-                                 dest: navi.destCoord,
-                                 vias: navi.vias.map { CLLocationCoordinate2D(latitude: $0.lat, longitude: $0.lng) },
-                                 night: settings.paletteNight)
-                        .frame(height: 230)
-                        .clipShape(RoundedRectangle(cornerRadius: 14))
+            }
+        }
+    }
+
+    /// 路线态：路线选项 + 途经点 + 不走高速 + 开始导航；模拟导航缩到右下角
+    private var routePanel: some View {
+        CardView {
+            HStack {
+                Text(dest?.name ?? "路线").foregroundColor(.white).bold().lineLimit(1)
+                Spacer()
+                Button("重选") { resetHome() }.font(.caption).foregroundColor(ContentView.sub)
+            }
+            if let sr = navi.shareRoute {
+                Text("按高德分享的\(sr.kind)路线走（\(NaviBridge.distText(Int(sr.total)))）")
+                    .font(.caption).foregroundColor(.orange)
+                if !navi.shareMatch.isEmpty { Text(navi.shareMatch).font(.caption).foregroundColor(ContentView.sub) }
+            }
+            if !navi.routeOptions.isEmpty {
+                ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 8) {
                         ForEach(navi.routeOptions) { o in
                             RouteCard(option: o, selected: o.id == navi.selectedRouteID)
+                                .frame(width: 126)
                                 .onTapGesture { navi.select(routeID: o.id) }
                         }
                     }
                 }
-                HStack(spacing: 12) {
-                    PillButton(title: "开始导航", color: ContentView.pink, enabled: navi.routeReady) {
-                        navi.start(emulate: false); showNavi = true
-                    }
-                    PillButton(title: "模拟导航", color: Color.purple, enabled: navi.routeReady) {
-                        navi.start(emulate: true); showNavi = true
-                    }
+            } else {
+                Text(navi.calculating ? "正在规划路线…" : (navi.planFailed ? "路线规划失败" : navi.info))
+                    .font(.footnote).foregroundColor(ContentView.sub)
+            }
+            if navi.planFailed && !navi.calculating {
+                Button { navi.replan() } label: {
+                    Label("重新规划", systemImage: "arrow.clockwise").font(.subheadline).foregroundColor(ContentView.cyan)
                 }
             }
+            if navi.shareRoute == nil {
+                HStack(spacing: 10) {
+                    Text(navi.vias.isEmpty ? "途经：无" : "途经：" + navi.vias.map { $0.name }.joined(separator: " → "))
+                        .font(.caption).foregroundColor(ContentView.sub).lineLimit(2)
+                    Spacer(minLength: 4)
+                    if !navi.vias.isEmpty {
+                        Button("清除") { navi.clearVias() }.font(.caption).foregroundColor(ContentView.sub)
+                    }
+                    Button { beginViaSearch() } label: {
+                        Label("添加途经点", systemImage: "plus.circle").font(.caption).foregroundColor(ContentView.cyan)
+                    }
+                    .disabled(navi.vias.count >= 3)
+                }
+            }
+            Toggle("不走高速", isOn: $settings.avoidHighway)
+                .font(.caption).foregroundColor(.white).tint(ContentView.pink)
+                .onChange(of: settings.avoidHighway) { _ in navi.replan() }
+            PillButton(title: "开始导航", color: ContentView.pink, enabled: navi.routeReady) {
+                navi.start(emulate: false); showNavi = true
+            }
+            HStack {
+                Spacer()
+                Button("模拟导航") { navi.start(emulate: true); showNavi = true }
+                    .font(.caption2).foregroundColor(ContentView.sub)
+                    .disabled(!navi.routeReady)
+            }
         }
-        }
+    }
+
+    /// 程序化改搜索框文字：值真的变了才压住下一次实时检索，避免抑制标记残留
+    private func setQuery(_ new: String) {
+        if query != new { suppressAutoSearch = true }
+        query = new
+    }
+
+    /// 输入实时检索：350ms 防抖 + 至少 2 个字；SearchService 自带关键词缓存
+    private func scheduleAutoSearch(_ raw: String) {
+        searchWork?.cancel()
+        pendingSearchSubmit = false      // 用户继续打字，就别再自动选「按搜索」那条结果了
+        let t = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard t.count >= 2, !settings.amapKeyInUse.isEmpty else { return }
+        let work = DispatchWorkItem { SearchService.shared.search(t) }
+        searchWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: work)
+    }
+
+    /// 按「搜索」：直接按当前词查一次（命中缓存不额外花额度），结果回来自动选第一条。
+    /// 不直接取 search.results，是因为 350ms 防抖可能还没跑完，那里可能是上一个词的结果。
+    private func submitSearch() {
+        suppressAutoSearch = false
+        hideKeyboard()
+        searchWork?.cancel()
+        let t = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !t.isEmpty else { return }
+        pendingSearchSubmit = true
+        guard !needAmapKey() else { pendingSearchSubmit = false; return }
+        SearchService.shared.search(t)
+    }
+
+    /// 用户重新输入：退出地点 / 路线态，回到搜索态（不动 query，避免递归触发 onChange）
+    private func backToSearch() {
+        navi.clearPlan()
+        dest = nil; homeFocus = nil; homeStage = .idle
+        sheetExpanded = false; addingVia = false
+        pendingSearchSubmit = false; autoStartNavi = false
+    }
+
+    /// 关闭按钮：完全回到首页空闲态
+    private func resetHome() {
+        setQuery("")
+        search.clear()
+        backToSearch()
+        shareStatus = ""
+    }
+
+    /// 点「路线」：这时才真正调高德算路
+    private func startRoutePlanning() {
+        guard let d = dest else { return }
+        homeStage = .routes
+        guard !needAmapKey() else { return }
+        navi.plan(toLat: d.lat, lng: d.lng)
+    }
+
+    /// 点「添加途经点」：搜索框临时切成途经点搜索，选完回到路线态
+    private func beginViaSearch() {
+        addingVia = true
+        setQuery("")
+        search.clear()
+        sheetExpanded = false
+        homeStage = .idle
     }
 
     /// 离现在位置的直线距离（搜索结果、最近去过右边显示）
@@ -345,24 +444,37 @@ struct ContentView: View {
         return f.string(from: Date().addingTimeInterval(TimeInterval(remainS)))
     }
 
-    /// 点了搜索结果或最近去过：选目的地，或者（正在选途经点时）加一个途经点
-    private func choose(_ p: SearchService.Place) {
-        guard !navi.navigating else {shareStatus="导航仍在运行；如需更换目的地，请先结束导航";return}
+    /// 点了搜索结果 / 自动检索结果：地图定位到该地点并出「路线」按钮。
+    /// autoPlan = true 只给「分享后自动导航」用，选中即算路并自动开始导航。
+    private func choose(_ p: SearchService.Place, autoPlan: Bool = false) {
+        guard !navi.navigating else { shareStatus = "导航仍在运行；如需更换目的地，请先结束导航"; return }
         guard !WebMotorSession.shared.running else { shareStatus = "请先结束网页导航"; return }
+        searchWork?.cancel()
+        pendingSearchSubmit = false
         search.clear()
         hideKeyboard()
         if addingVia {
             addingVia = false
-            query = dest?.name ?? ""
-            navi.addVia(name: p.name, lat: p.lat, lng: p.lng)
+            setQuery(dest?.name ?? "")
+            if !needAmapKey() { navi.addVia(name: p.name, lat: p.lat, lng: p.lng) }
+            homeStage = .routes
+            overviewToken += 1
             return
         }
         dest = p
-        query = p.name                                  // 只改文字，不会再触发搜索
+        setQuery(p.name)
         shareStatus = ""
         History.shared.add(p)
-        if needAmapKey() { return }
-        navi.plan(toLat: p.lat, lng: p.lng)
+        homeFocus = CLLocationCoordinate2D(latitude: p.lat, longitude: p.lng)
+        focusToken += 1
+        sheetExpanded = false
+        if autoPlan {
+            homeStage = .routes
+            if !needAmapKey() { navi.plan(toLat: p.lat, lng: p.lng) }
+        } else {
+            homeStage = .place
+            navi.clearPlan()
+        }
     }
 
     /// 手动兜底按钮：读剪贴板（分享扩展打不开主 App 时会把内容暂存到这里）
@@ -436,8 +548,12 @@ struct ContentView: View {
                     let name = r.endName.isEmpty ? "分享的目的地" : r.endName
                     dest = SearchService.Place(name: name, address: "高德分享的\(r.kind)路线", lat: r.endLat, lng: r.endLng)
                     History.shared.add(SearchService.Place(name: name, address: "", lat: r.endLat, lng: r.endLng))
-                    query = name
+                    setQuery(name)
                     search.clear()
+                    homeFocus = CLLocationCoordinate2D(latitude: r.endLat, longitude: r.endLng)
+                    focusToken += 1
+                    homeStage = .routes
+                    sheetExpanded = false
                     if r.kind == "自行车" {
                         navi.clearPlan()
                         WebMotorSession.shared.route = MotorRoutes.fromShare(r)
@@ -470,7 +586,7 @@ struct ContentView: View {
                 case .place(let p):
                     applyPlace(p)
                 case .needSearch(let name):
-                    query = name
+                    setQuery(name)
                     shareStatus = "分享里只有地名「\(name)」，正在用高德搜索…"
                     guard !needAmapKey() else { return }
                     autoPickResult = true
@@ -487,9 +603,13 @@ struct ContentView: View {
     private func applyPlace(_ p: SharePlace.Place) {
         let place = SearchService.Place(name: p.name, address: "来自\(p.source)分享", lat: p.lat, lng: p.lng)
         dest = place
-        query = p.name
+        setQuery(p.name)
         search.clear()
         History.shared.add(place)
+        homeFocus = CLLocationCoordinate2D(latitude: p.lat, longitude: p.lng)
+        focusToken += 1
+        homeStage = .routes
+        sheetExpanded = false
         shareStatus = "已收到\(p.source)分享的地点：\(p.name)（\(String(format: "%.5f", p.lat)), \(String(format: "%.5f", p.lng))），正在规划…"
         guard !needAmapKey() else { return }
         autoStartNavi = true
@@ -498,26 +618,63 @@ struct ContentView: View {
         navi.plan(toLat: p.lat, lng: p.lng)
     }
 
-    // MARK: 首页：高德地图打底 + 底部可上滑搜索抽屉
+    // MARK: 首页：高德地图打底 + 按阶段变化的底部面板
     private var homePage: some View {
         GeometryReader { geo in
             ZStack(alignment: .bottom) {
-                HomeMapView(night: settings.paletteNight)
+                ZStack(alignment: .bottomTrailing) {
+                    HomeMapView(
+                        night: settings.paletteNight,
+                        focus: homeFocus,
+                        focusToken: focusToken,
+                        recenterToken: recenterToken,
+                        overviewToken: overviewToken,
+                        routes: (homeStage == .routes || addingVia) ? navi.routeOptions : [],
+                        selectedRouteID: navi.selectedRouteID,
+                        ghost: navi.shareRoute?.pts.map { CLLocationCoordinate2D(latitude: $0.lat, longitude: $0.lng) } ?? [],
+                        dest: (homeStage == .routes || addingVia) ? navi.destCoord : nil,
+                        vias: navi.vias.map { CLLocationCoordinate2D(latitude: $0.lat, longitude: $0.lng) },
+                        bottomInset: panelHeight(geo)
+                    )
                     .ignoresSafeArea()
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
 
-                // 收起态：没有内容时只留「抓手 + 搜索框」，抽屉变矮，搜索框随之整体下移；
-                // 一旦有搜索结果 / 目的地 / 状态提示，恢复 250pt 保证内容可见。
-                homeDrawer(height: sheetExpanded ? min(geo.size.height * 0.82, 640)
-                                                 : (hasHomeContent ? 250 : 122))
+                    recenterButton
+                        .padding(.trailing, 16)
+                        .padding(.bottom, panelHeight(geo) + 14)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+                homeDrawer(height: panelHeight(geo))
             }
         }
     }
 
-    /// 抽屉：抓手 + 搜索框固定；上滑后下面展开巡航 / 路线规划 / 常用目的地 / 骑行轨迹
+    /// 右下角：回到我的定位位置
+    private var recenterButton: some View {
+        Button { recenterToken += 1 } label: {
+            Image(systemName: "location.fill")
+                .font(.system(size: 18))
+                .foregroundColor(.white)
+                .frame(width: 44, height: 44)
+                .background(RoundedRectangle(cornerRadius: 12).fill(Self.card.opacity(0.94)))
+                .overlay(RoundedRectangle(cornerRadius: 12).stroke(Self.stroke, lineWidth: 1))
+        }
+        .accessibilityLabel("回到定位位置")
+    }
+
+    /// 面板高度跟着阶段走：空闲最矮，搜索结果 / 地点 / 路线依次升高
+    private func panelHeight(_ geo: GeometryProxy) -> CGFloat {
+        if sheetExpanded { return min(geo.size.height * 0.82, 640) }
+        if homeStage == .place { return 200 }
+        if homeStage == .routes { return min(geo.size.height * 0.48, 350) }
+        return hasSearchContent ? min(geo.size.height * 0.52, 400) : 122
+    }
+
+    /// 抽屉：抓手 + 搜索框固定；上滑在任何阶段都能展开功能入口
     private func homeDrawer(height: CGFloat) -> some View {
-        let showList = sheetExpanded || hasHomeContent
+        let showList = sheetExpanded || homeStage != .idle || hasSearchContent
         return VStack(spacing: 0) {
-            // 收起且没有内容时，把抓手 + 搜索框推到抽屉底部，地图露出更多
             if !showList { Spacer(minLength: 0) }
 
             VStack(spacing: 0) {
@@ -525,7 +682,6 @@ struct ContentView: View {
                     .frame(maxWidth: .infinity, minHeight: 22)
                     .contentShape(Rectangle())
                     .onTapGesture { toggleSheet() }
-
                 homeSearchBar.padding(.horizontal, 14).padding(.bottom, 10)
             }
             // 手势只加在「抓手 + 搜索框」区域，避免和下面列表滚动打架
@@ -536,8 +692,14 @@ struct ContentView: View {
 
             if showList {
                 ScrollView {
-                    VStack(alignment: .leading, spacing: 14) {
-                        homeDestSection
+                    VStack(alignment: .leading, spacing: 12) {
+                        if homeStage == .idle {
+                            searchResultSection
+                        } else if homeStage == .place {
+                            placeCard
+                        } else {
+                            routePanel
+                        }
                         if sheetExpanded {
                             shareImportCard
                             cruiseCard
@@ -545,7 +707,10 @@ struct ContentView: View {
                             favoritesCard
                             ridesCard
                         }
-                        Color.clear.frame(height: 8)
+                        if !shareStatus.isEmpty && homeStage != .idle {
+                            Text(shareStatus).font(.caption2).foregroundColor(ContentView.sub)
+                        }
+                        Color.clear.frame(height: 6)
                     }
                     .padding(.horizontal, 14).padding(.bottom, 18)
                 }
@@ -558,8 +723,9 @@ struct ContentView: View {
         .frame(maxWidth: .infinity)
         .background(RoundedRectangle(cornerRadius: 22, style: .continuous).fill(Self.card.opacity(0.97)))
         .overlay(RoundedRectangle(cornerRadius: 22, style: .continuous).stroke(Self.stroke, lineWidth: 1))
+        .animation(.spring(response: 0.34, dampingFraction: 0.86), value: homeStage)
         .animation(.spring(response: 0.34, dampingFraction: 0.86), value: sheetExpanded)
-        .animation(.spring(response: 0.34, dampingFraction: 0.86), value: hasHomeContent)
+        .animation(.spring(response: 0.34, dampingFraction: 0.86), value: hasSearchContent)
     }
 
     private func setSheet(_ v: Bool) {
@@ -900,25 +1066,141 @@ func hideKeyboard() {
     UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
 }
 
-// MARK: - 首页底图：高德地图，跟随定位
+// MARK: - 首页三阶段
+private enum HomeStage: Equatable { case idle, place, routes }
+
+// MARK: - 首页底图：高德地图，跟随定位 + 画路线 / 大头针
 /// 复用工程里已有的高德 SDK（MAMapView 由 Bridging Header 引入），不新增依赖、不改 pbxproj。
 struct HomeMapView: UIViewRepresentable {
     let night: Bool
+    var focus: CLLocationCoordinate2D? = nil
+    var focusToken = 0
+    var recenterToken = 0
+    var overviewToken = 0
+    var routes: [NaviBridge.RouteOption] = []
+    var selectedRouteID = -1
+    var ghost: [CLLocationCoordinate2D] = []
+    var dest: CLLocationCoordinate2D? = nil
+    var vias: [CLLocationCoordinate2D] = []
+    var bottomInset: CGFloat = 122
+
+    func makeCoordinator() -> HomeMapDelegate { HomeMapDelegate() }
 
     func makeUIView(context: Context) -> MAMapView {
         let map = MAMapView(frame: .zero)
         map.mapType = night ? .standardNight : .standard
         map.showsCompass = false
+        map.showsScale = false
         map.showsUserLocation = true
         if let p = NaviBridge.shared.myPosition() {
             map.setCenter(CLLocationCoordinate2D(latitude: p.lat, longitude: p.lng), animated: false)
         }
         map.zoomLevel = 16
         map.userTrackingMode = .follow
+        map.delegate = context.coordinator.asDelegate
         return map
     }
 
     func updateUIView(_ map: MAMapView, context: Context) {
-        map.mapType = night ? .standardNight : .standard
+        let type: MAMapType = night ? .standardNight : .standard
+        if map.mapType != type { map.mapType = type }
+        let c = context.coordinator
+
+        // 内容没变就不重画，避免 SwiftUI 频繁刷新把地图拖卡
+        let key = routes.map { "\($0.id):\($0.coords.count)" }.joined(separator: ",")
+            + "|\(selectedRouteID)|\(ghost.count)|"
+            + (dest.map { "\($0.latitude),\($0.longitude)" } ?? "")
+            + "|" + vias.map { "\($0.latitude),\($0.longitude)" }.joined(separator: ";")
+            + "|" + (focus.map { "\($0.latitude),\($0.longitude)" } ?? "")
+            + "|f\(focusToken)"
+        if c.key != key {
+            c.key = key
+            if let old = map.overlays { map.removeOverlays(old) }
+            let oldPins = (map.annotations ?? []).compactMap { $0 as? MAPointAnnotation }
+            if !oldPins.isEmpty { map.removeAnnotations(oldPins) }
+
+            var pins: [MAPointAnnotation] = []
+            for (i, v) in vias.enumerated() {
+                let a = MAPointAnnotation(); a.coordinate = v; a.title = "途经 \(i + 1)"; pins.append(a)
+            }
+            if let d = dest ?? focus {
+                let a = MAPointAnnotation(); a.coordinate = d; a.title = "目的地"; pins.append(a)
+            }
+            if !pins.isEmpty { map.addAnnotations(pins) }
+
+            var lines: [MAPolyline] = []
+            func add(_ coords: [CLLocationCoordinate2D], _ kind: String) {
+                guard coords.count >= 2 else { return }
+                var cc = coords
+                if let l = MAPolyline(coordinates: &cc, count: UInt(cc.count)) { l.title = kind; lines.append(l) }
+            }
+            add(ghost, "ghost")
+            for r in routes where r.id != selectedRouteID { add(r.coords, "alt") }
+            if let s = routes.first(where: { $0.id == selectedRouteID }) { add(s.coords, "sel") }
+            if !lines.isEmpty { map.addOverlays(lines) }
+        }
+
+        if c.focusSeq != focusToken {
+            c.focusSeq = focusToken
+            if let f = focus {
+                map.userTrackingMode = MAUserTrackingMode.none
+                map.setCenter(f, animated: true)
+                map.setZoomLevel(15.5, animated: true)
+            }
+        }
+        if c.recenterSeq != recenterToken {
+            c.recenterSeq = recenterToken
+            map.userTrackingMode = .follow
+            map.setZoomLevel(16, animated: true)
+        }
+        if c.overviewSeq != overviewToken {
+            c.overviewSeq = overviewToken
+            if let lines = map.overlays, !lines.isEmpty {
+                map.userTrackingMode = MAUserTrackingMode.none
+                map.showOverlays(lines, edgePadding: UIEdgeInsets(top: 70, left: 36, bottom: bottomInset + 18, right: 36), animated: false)
+            }
+        }
+    }
+}
+
+/// 地图回调：选中路线粉色粗线、备选灰色、分享原路线橙色虚线；目的地红针、途经点紫针。
+/// 与工程里的 RouteMapDelegate 同样用运行时登记协议，避开 Swift / 高德 SDK 方法名冲突。
+final class HomeMapDelegate: NSObject {
+    var key = ""
+    var focusSeq = -1
+    var recenterSeq = -1
+    var overviewSeq = -1
+
+    var asDelegate: MAMapViewDelegate? {
+        class_addProtocol(HomeMapDelegate.self, MAMapViewDelegate.self)
+        return (self as AnyObject) as? MAMapViewDelegate
+    }
+
+    @objc(mapView:viewForAnnotation:)
+    func annotationView(_ m: MAMapView, annotation: MAAnnotation) -> MAAnnotationView? {
+        guard let a = annotation as? MAPointAnnotation else { return nil }
+        let id = "homePin"
+        let v = (m.dequeueReusableAnnotationView(withIdentifier: id) as? MAPinAnnotationView) ?? MAPinAnnotationView(annotation: a, reuseIdentifier: id)
+        v?.annotation = a
+        v?.pinColor = a.title == "目的地" ? .red : .purple
+        v?.canShowCallout = false
+        return v
+    }
+
+    @objc(mapView:rendererForOverlay:)
+    func renderer(_ m: MAMapView, overlay: MAOverlay) -> MAOverlayRenderer? {
+        guard let pl = overlay as? MAPolyline, let r = MAPolylineRenderer(polyline: pl) else { return nil }
+        r.lineJoinType = kMALineJoinRound
+        r.lineCapType = kMALineCapRound
+        switch pl.title {
+        case "sel":
+            r.strokeColor = UIColor(red: 1, green: 0.31, blue: 0.71, alpha: 1); r.lineWidth = 8
+        case "ghost":
+            r.strokeColor = UIColor(red: 1, green: 0.62, blue: 0.15, alpha: 0.95); r.lineWidth = 4
+            r.lineDashType = kMALineDashTypeSquare
+        default:
+            r.strokeColor = UIColor(white: 0.6, alpha: 0.7); r.lineWidth = 6
+        }
+        return r
     }
 }
