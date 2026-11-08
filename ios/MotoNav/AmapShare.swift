@@ -643,8 +643,13 @@ enum SharePlace {
         for u in candidates {
             if let p = parseURL(u, fullText: text) { return .place(p) }
         }
+        // 苹果地图的 vCard / 名片里可能只有 GEO:纬度;经度，没有 http 链接
+        if let p = parseVCardGeo(text) { return .place(p) }
         if let p = parseRouteText(text) { return .place(p) }
         if let p = parseTextCoords(text) { return .place(p) }
+        // 苹果地图「分享地点」有时只给 maps.apple.com/?q=地点名，
+        // 没有坐标时用地名走高德搜索（主 App 自动选第一条并直接开导航）
+        if let n = queryName(in: candidates) { return .needSearch(n) }
         if let n = guessName(text) { return .needSearch(n) }
         return .none
     }
@@ -652,13 +657,15 @@ enum SharePlace {
     // MARK: URL 收集 / 短链展开
 
     private static func extractURLs(_ s: String) -> [String] {
-        guard let re = try? NSRegularExpression(pattern: #"(?:https?://|geo:|maps:|amapuri://|iosamap://|androidamap://)[^\s，。、"'<>（）)】]+"#) else { return [] }
+        // 苹果地图把链接塞在 vCard 的 itemN.URL;type=pref: 后面，行尾可能带 ; 或 \r，
+        // 这里把分隔符一起排除，避免把整张名片当成 URL 的一部分。
+        guard let re = try? NSRegularExpression(pattern: #"(?:https?://|geo:|maps:|amapuri://|iosamap://|androidamap://)[^\s，。、"'<>()（）【】;]+"#) else { return [] }
         let ns = s as NSString
         return re.matches(in: s, range: NSRange(location: 0, length: ns.length)).map { ns.substring(with: $0.range) }
     }
 
     private static func hasCoordHint(_ u: String) -> Bool {
-        for k in ["ll=", "position=", "coordinate=", "center=", "daddr=", "dlat=", "saddr=", "q=", "/@"] {
+        for k in ["ll=", "position=", "coordinate=", "center=", "daddr=", "dlat=", "saddr=", "q=", "to=", "lat=", "lng=", "/@"] {
             if u.contains(k) { return true }
         }
         return false
@@ -708,38 +715,49 @@ enum SharePlace {
         for item in c.queryItems ?? [] { if let v = item.value { q[item.name.lowercased()] = v } }
 
         let isAmap = host.contains("amap.com") || u.hasPrefix("amapuri") || u.hasPrefix("iosamap") || u.hasPrefix("androidamap")
+        // 高德 uri.amap.com/marker 允许 coordinate=wgs84，这时坐标是 WGS-84，必须转火星坐标
+        let wgsParam = (q["coordinate"] ?? "").lowercased() == "wgs84"
         let isWGS = host.contains("apple.com") || host.contains("google") || host.contains("goo.gl")
-            || host.contains("openstreetmap") || host.contains("bing.com") || u.lowercased().hasPrefix("geo:")
+            || host.contains("openstreetmap") || host.contains("bing.com") || u.lowercased().hasPrefix("geo:") || wgsParam
         let defOrder: Order = isAmap ? .lonLat : .latLng      // 高德是「经度,纬度」，Apple/Google 是「纬度,经度」
 
         var coord: (lat: Double, lng: Double)?
+        var routeName = ""
 
         if u.lowercased().hasPrefix("geo:") { coord = pair(path, order: .latLng) }
-        // 路线分享优先拿「终点」，别一不小心拿起点去导航
+        // 高德导航 URI：to=经度,纬度,终点名 —— 只取终点，别拿 from 里的起点
+        if coord == nil, let v = q["to"] {
+            let f = v.components(separatedBy: ",")
+            if f.count >= 2 { coord = pair("\(f[0]),\(f[1])", order: defOrder) }
+            if f.count >= 3 { routeName = f[2] }
+        }
         if coord == nil, let v = q["daddr"] { coord = pair(v, order: defOrder) }
         if coord == nil, let la = q["dlat"].flatMap(Double.init), let lo = q["dlon"].flatMap(Double.init),
            la >= -90, la <= 90, lo >= -180, lo <= 180 { coord = (la, lo) }
-        if coord == nil, let e = routeEnd(u) { coord = (e.lat, e.lng) }
+        if coord == nil, let e = routeEnd(u) { coord = (e.lat, e.lng); routeName = e.name }
+        // 苹果地图「分享地点」的 q= 常直接是「纬度,经度」，必须排在 sll 前面：
+        // sll 是地图中心 / 当前位置，不是目的地。
+        if coord == nil, let v = q["q"] { coord = pair(v, order: .auto) }
         // 地点分享的各种参数
         if coord == nil, let v = q["position"] { coord = pair(v, order: .lonLat) }
         if coord == nil, let v = q["location"] { coord = pair(v, order: .lonLat) }
         if coord == nil, let v = q["ll"] { coord = pair(v, order: .latLng) }
         if coord == nil, let v = q["coordinate"] { coord = pair(v, order: .latLng) }
         if coord == nil, let v = q["center"] { coord = pair(v, order: .latLng) }
-        if coord == nil, let v = q["sll"] { coord = pair(v, order: .latLng) }
-        if coord == nil, let v = q["q"] { coord = pair(v, order: .auto) }
         if coord == nil, let la = q["lat"].flatMap(Double.init), let lo = (q["lng"] ?? q["lon"]).flatMap(Double.init) { coord = (la, lo) }
         if coord == nil, let la = q["latitude"].flatMap(Double.init), let lo = q["longitude"].flatMap(Double.init) { coord = (la, lo) }
         if coord == nil, let v = q["p"] { coord = pair(v, order: .lonLat) }
         if coord == nil { coord = pair(atSignIn(path), order: .latLng) }
         if coord == nil, let v = q["near"] { coord = pair(v, order: .latLng) }
-        if coord == nil, let v = q["saddr"] { coord = pair(v, order: defOrder) }   // 最后兜底
+        if coord == nil, let v = q["sll"] { coord = pair(v, order: .latLng) }        // 地图中心，靠后
+        if coord == nil, let v = q["saddr"] { coord = pair(v, order: defOrder) }      // 起点，最后兜底
         guard var c2 = coord else { return nil }
 
         var name = ""
         for k in ["name", "poiname", "dname", "title", "query", "q"] {
             if let v = q[k], !v.isEmpty, isName(v) { name = v; break }
         }
+        if name.isEmpty, !routeName.isEmpty { name = routeName }
         if name.isEmpty, let e = routeEnd(u), !e.name.isEmpty { name = e.name }
         if name.isEmpty { name = guessName(fullText) ?? "" }
 
@@ -812,6 +830,35 @@ enum SharePlace {
                   let b = Double(ns.substring(with: m.range(at: 2))),
                   let c = pair("\(a),\(b)", order: .auto) else { continue }
             return Place(name: guessName(text) ?? "分享的地点", lat: c.lat, lng: c.lng, source: "分享文本坐标")
+        }
+        return nil
+    }
+
+    /// vCard 里的 GEO:纬度;经度（苹果地图 / 联系人「分享位置」可能只给名片）
+    private static func parseVCardGeo(_ text: String) -> Place? {
+        guard let re = try? NSRegularExpression(pattern: #"GEO:(-?\d+\.\d+);(-?\d+\.\d+)"#) else { return nil }
+        let ns = text as NSString
+        guard let m = re.firstMatch(in: text, range: NSRange(location: 0, length: ns.length)), m.numberOfRanges > 2,
+              let la = Double(ns.substring(with: m.range(at: 1))),
+              let lo = Double(ns.substring(with: m.range(at: 2))) else { return nil }
+        let g = MapGeo.wgsToGcj(la, lo)              // 名片是 WGS-84，高德 SDK 要 GCJ-02
+        return Place(name: guessName(text) ?? "分享的地点", lat: g.lat, lng: g.lng, source: "苹果地图名片")
+    }
+
+    /// 分享链接里只有地名、没有坐标时（maps.apple.com/?q=望京SOHO），
+    /// 把 q= / name= 里的名字拿出来交给高德搜索，主 App 会自动选第一条并开始导航。
+    private static func queryName(in urls: [String]) -> String? {
+        for u in urls {
+            guard let c = URLComponents(string: u) else { continue }
+            for item in c.queryItems ?? [] {
+                guard let v = item.value, !v.isEmpty else { continue }
+                let k = item.name.lowercased()
+                guard ["q", "name", "poiname", "dname", "query", "title"].contains(k) else { continue }
+                if pair(v, order: .auto) != nil { continue }     // 是坐标，不是名字
+                let name = v.removingPercentEncoding ?? v
+                if name.count > 40 || name.contains("http") { continue }
+                return name
+            }
         }
         return nil
     }

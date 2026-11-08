@@ -37,6 +37,8 @@ struct ContentView: View {
     @State private var autoPickResult = false       // 只有地名时：搜索结果回来自动选第一条
     @State private var cruiseNote = ""
     @State private var addingVia = false               // 正在搜途经点
+    @Environment(\.scenePhase) private var scenePhase
+    @State private var lastHandledShare = ""        // 去重：onOpenURL 和前台自动消费可能同时到
 
     static let bg = Color(red: 0.055, green: 0.04, blue: 0.08)
     static let card = Color(red: 0.10, green: 0.08, blue: 0.14)
@@ -93,12 +95,22 @@ struct ContentView: View {
                 ContentView.keyPrompted = true
                 showKeys = true
             }
+            // 冷启动时通知可能比界面先到，补一次
+            flushPendingShare()
+        }
+        .onChange(of: scenePhase) { phase in
+            if phase == .active { flushPendingShare() }
+        }
+        // 用户点了分享扩展发的本地通知：内容直接随通知带过来，不用读剪贴板
+        .onReceive(NotificationCenter.default.publisher(for: AppDelegate.shareNotification)) { note in
+            guard let t = note.object as? String else { return }
+            deliverShare(t)
         }
         .onOpenURL { url in                            // 高德 / 苹果地图「分享到 MotoNav」：motonav://share?t=分享的文字
             guard url.scheme == "motonav",
                   let t = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first(where: { $0.name == "t" })?.value
             else { return }
-            handleShare(t)
+            deliverShare(t)
         }
         // 只解析出地名时，等搜索结果回来自动选第一条（见 importPlaceShare）
         .onReceive(search.$results) { rs in
@@ -203,7 +215,7 @@ struct ContentView: View {
                 .font(.subheadline).foregroundColor(Color.orange)
             }
             .disabled(shareBusy)
-            Text("高德路线、高德地点、苹果地图地点都行：地图里点分享 → 选 MotoNav；系统没跳转时点上面这行").font(.caption2).foregroundColor(ContentView.sub)
+            Text("高德路线、高德地点、苹果地图地点都行：地图里点分享 → 选 MotoNav → 切回本 App（或点通知）即自动开始导航").font(.caption2).foregroundColor(ContentView.sub)
             }
             if !shareStatus.isEmpty { Text(shareStatus).font(.footnote).foregroundColor(ContentView.sub) }
             if !search.status.isEmpty { Text(search.status).font(.footnote).foregroundColor(ContentView.sub) }
@@ -353,7 +365,7 @@ struct ContentView: View {
         navi.plan(toLat: p.lat, lng: p.lng)
     }
 
-    /// 读剪贴板（分享扩展打不开主 App 时会把内容暂存到这里）
+    /// 手动兜底按钮：读剪贴板（分享扩展打不开主 App 时会把内容暂存到这里）
     private func pasteShare() {
         guard let raw = UIPasteboard.general.string, !raw.isEmpty else {
             shareStatus = "剪贴板是空的：先在地图 App 里点分享 → 选 MotoNav，或复制分享内容"
@@ -362,10 +374,28 @@ struct ContentView: View {
         let t = SharePlace.strip(raw)
         guard !t.isEmpty else { shareStatus = "剪贴板里没有分享内容"; return }
         if raw.hasPrefix(SharePlace.inboxTag) { UIPasteboard.general.string = "" }   // 消费掉标记，避免重复导入
+        lastHandledShare = ""
         handleShare(t)
     }
 
-    /// 分享统一入口：URL Scheme（onOpenURL）和剪贴板兜底都走这里
+    /// AppDelegate 收到通知但界面还没起来时，先暂存；界面出现 / 回到前台再补一次。
+    private func flushPendingShare() {
+        guard let t = AppDelegate.pendingShareText, !t.isEmpty else { return }
+        AppDelegate.pendingShareText = nil
+        deliverShare(t)
+    }
+
+    /// 自动路径统一入口：URL Scheme 或通知都带着分享正文，
+    /// 完全不需要读系统剪贴板，因此不会触发 iOS 16+ 的「允许粘贴」弹窗。
+    private func deliverShare(_ raw: String) {
+        let t = SharePlace.strip(raw)
+        guard !t.isEmpty, t != lastHandledShare, !shareBusy else { return }
+        lastHandledShare = t
+        UIPasteboard.general.string = ""      // 只写不读：清掉扩展留的暂存，避免按钮重复导入
+        handleShare(t)
+    }
+
+    /// 分享统一入口：URL Scheme（onOpenURL）、前台自动消费、剪贴板按钮都走这里
     private func handleShare(_ raw: String) {
         let t = SharePlace.strip(raw)
         guard !t.isEmpty else { shareStatus = "分享内容为空"; return }
@@ -379,7 +409,7 @@ struct ContentView: View {
 
         // 只有高德「路线分享」才走原来的整条路线还原；高德地点分享直接按地点处理
         let looksLikeRoute = t.contains("shareParam") || t.contains("__r=") || t.contains("/navigation/")
-            || t.contains("daddr=") || t.contains("saddr=") || t.contains("路线")
+            || t.contains("daddr=") || t.contains("saddr=") || t.contains("uri.amap.com/navigation")
         if AmapShare.findUrl(t) != nil && looksLikeRoute {
             importRouteShare(t)
         } else {

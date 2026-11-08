@@ -1,11 +1,16 @@
 import SwiftUI
+import UserNotifications
 
 /// 版本：跟随 App 版本（见 Config.swift）
 ///
 /// 高德导航界面（AMapNaviDriveView）创建时会调用 UIApplication.shared.delegate.window 判断是不是刘海屏。
 /// SwiftUI 默认的 AppDelegate 没有 window，会直接崩溃（iOS v0.1.1 点“开始导航”就闪退的原因），
 /// 所以这里补一个 AppDelegate，window 返回当前显示的窗口。
-final class AppDelegate: NSObject, UIApplicationDelegate {
+final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDelegate {
+    static let shareNotification = NSNotification.Name("MotoNavShareIncoming")
+    /// 冷启动时 didReceive 可能早于 ContentView 建立订阅，先存这里
+    static var pendingShareText: String?
+
     var window: UIWindow? {
         get {
             let wins = UIApplication.shared.connectedScenes
@@ -14,6 +19,33 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
             return wins.first { $0.isKeyWindow } ?? wins.first
         }
         set {}
+    }
+
+    /// 分享扩展在 iOS 18 上无法拉起主 App，只能发本地通知把用户带回来。
+    /// 所以主 App 必须先申请通知权限，否则通知会被系统静默丢弃。
+    func application(_ application: UIApplication,
+                     didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
+        let center = UNUserNotificationCenter.current()
+        center.delegate = self
+        center.requestAuthorization(options: [.alert, .sound]) { _, _ in }
+        return true
+    }
+
+    func userNotificationCenter(_ center: UNUserNotificationCenter,
+                                willPresent notification: UNNotification,
+                                withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
+        completionHandler([.banner, .sound])
+    }
+
+    /// 用户点「MotoNav 已收到地点」通知 → 直接把分享正文交给主界面 → 自动规划并开始导航
+    func userNotificationCenter(_ center: UNUserNotificationCenter,
+                                didReceive response: UNNotificationResponse,
+                                withCompletionHandler completionHandler: @escaping () -> Void) {
+        if let t = response.notification.request.content.userInfo["t"] as? String, !t.isEmpty {
+            AppDelegate.pendingShareText = t
+            NotificationCenter.default.post(name: AppDelegate.shareNotification, object: t)
+        }
+        completionHandler()
     }
 }
 
