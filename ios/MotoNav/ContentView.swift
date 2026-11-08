@@ -299,7 +299,7 @@ struct ContentView: View {
                     Button("取消") { resetHome() }.font(.subheadline).foregroundColor(ContentView.sub)
                     Button { startRoutePlanning() } label: {
                         Text("路线").font(.headline).foregroundColor(.white)
-                            .frame(width: 108, minHeight: 44)
+                            .frame(minWidth: 108, maxWidth: 108, minHeight: 44)
                             .background(Capsule().fill(ContentView.pink))
                     }
                 }
@@ -341,7 +341,7 @@ struct ContentView: View {
             }
             if navi.shareRoute == nil {
                 HStack(spacing: 10) {
-                    Text(navi.vias.isEmpty ? "途经：无" : "途经：" + navi.vias.map { $0.name }.joined(separator: " → "))
+                    Text(viaSummary)
                         .font(.caption).foregroundColor(ContentView.sub).lineLimit(2)
                     Spacer(minLength: 4)
                     if !navi.vias.isEmpty {
@@ -610,12 +610,31 @@ struct ContentView: View {
         focusToken += 1
         homeStage = .routes
         sheetExpanded = false
-        shareStatus = "已收到\(p.source)分享的地点：\(p.name)（\(String(format: "%.5f", p.lat)), \(String(format: "%.5f", p.lng))），正在规划…"
+        let coordText = String(format: "%.5f, %.5f", p.lat, p.lng)
+        shareStatus = "已收到\(p.source)分享的地点：\(p.name)（\(coordText)），正在规划…"
         guard !needAmapKey() else { return }
         autoStartNavi = true
         // 规划失败时别让这个标记一直挂着，避免以后手动规划也被强制自动开始
         DispatchQueue.main.asyncAfter(deadline: .now() + 30) { if autoStartNavi { autoStartNavi = false } }
         navi.plan(toLat: p.lat, lng: p.lng)
+    }
+
+    /// 途经点文字：单独算，别塞进 ViewBuilder 里让类型检查器猜
+    private var viaSummary: String {
+        if navi.vias.isEmpty { return "途经：无" }
+        let names: [String] = navi.vias.map { $0.name }
+        return "途经：" + names.joined(separator: " → ")
+    }
+
+    /// 分享原路线的折线（橙色虚线）
+    private var shareGhost: [CLLocationCoordinate2D] {
+        guard let r = navi.shareRoute else { return [] }
+        return r.pts.map { CLLocationCoordinate2D(latitude: $0.lat, longitude: $0.lng) }
+    }
+
+    /// 途经点坐标
+    private var viaCoords: [CLLocationCoordinate2D] {
+        navi.vias.map { CLLocationCoordinate2D(latitude: $0.lat, longitude: $0.lng) }
     }
 
     // MARK: 首页：高德地图打底 + 按阶段变化的底部面板
@@ -631,9 +650,9 @@ struct ContentView: View {
                         overviewToken: overviewToken,
                         routes: (homeStage == .routes || addingVia) ? navi.routeOptions : [],
                         selectedRouteID: navi.selectedRouteID,
-                        ghost: navi.shareRoute?.pts.map { CLLocationCoordinate2D(latitude: $0.lat, longitude: $0.lng) } ?? [],
+                        ghost: shareGhost,
                         dest: (homeStage == .routes || addingVia) ? navi.destCoord : nil,
-                        vias: navi.vias.map { CLLocationCoordinate2D(latitude: $0.lat, longitude: $0.lng) },
+                        vias: viaCoords,
                         bottomInset: panelHeight(geo)
                     )
                     .ignoresSafeArea()
@@ -1084,6 +1103,12 @@ struct HomeMapView: UIViewRepresentable {
     var vias: [CLLocationCoordinate2D] = []
     var bottomInset: CGFloat = 122
 
+    /// 坐标指纹：把字符串插值从长链式表达式里拆出来
+    private static func coordKey(_ c: CLLocationCoordinate2D?) -> String {
+        guard let c = c else { return "" }
+        return String(format: "%.6f,%.6f", c.latitude, c.longitude)
+    }
+
     func makeCoordinator() -> HomeMapDelegate { HomeMapDelegate() }
 
     func makeUIView(context: Context) -> MAMapView {
@@ -1106,13 +1131,18 @@ struct HomeMapView: UIViewRepresentable {
         if map.mapType != type { map.mapType = type }
         let c = context.coordinator
 
-        // 内容没变就不重画，避免 SwiftUI 频繁刷新把地图拖卡
-        let key = routes.map { "\($0.id):\($0.coords.count)" }.joined(separator: ",")
-            + "|\(selectedRouteID)|\(ghost.count)|"
-            + (dest.map { "\($0.latitude),\($0.longitude)" } ?? "")
-            + "|" + vias.map { "\($0.latitude),\($0.longitude)" }.joined(separator: ";")
-            + "|" + (focus.map { "\($0.latitude),\($0.longitude)" } ?? "")
-            + "|f\(focusToken)"
+        // 内容没变就不重画，避免 SwiftUI 频繁刷新把地图拖卡。
+        // 拆成带显式类型的小表达式：整段长链式插值会让 Swift 类型检查器超时（Xcode 16.4 实测）。
+        let routeKey: String = routes.map { (r: NaviBridge.RouteOption) -> String in
+            "\(r.id):\(r.coords.count)"
+        }.joined(separator: ",")
+        let destKey: String = HomeMapView.coordKey(dest)
+        let viaKey: String = vias.map { (p: CLLocationCoordinate2D) -> String in
+            HomeMapView.coordKey(p)
+        }.joined(separator: ";")
+        let focusKey: String = HomeMapView.coordKey(focus)
+        let head: String = "|" + String(selectedRouteID) + "|" + String(ghost.count) + "|"
+        let key: String = routeKey + head + destKey + "|" + viaKey + "|" + focusKey + "|f" + String(focusToken)
         if c.key != key {
             c.key = key
             if let old = map.overlays { map.removeOverlays(old) }
