@@ -104,6 +104,11 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: MotoNav-unsigned-IPA
-          path: output/
+          # 只传成品，不要把 output/Derived 里 6000+ 个 Xcode 中间文件打进压缩包：
+          # 其中的 .xcfilelist 本身就有 215+ 字符，Windows 解压会报 0x80010135「路径太长」。
+          path: |
+            output/MotoNav-*.ipa
+            output/SHA256SUMS.txt
+            output/build-ios.log
           if-no-files-found: warn
           retention-days: 30
