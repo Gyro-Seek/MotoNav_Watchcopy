@@ -111,6 +111,54 @@ final class Settings: ObservableObject {
     @Published private(set) var paletteNight = false
     /// 规划路线时不走高速（摩托车默认打开）
     @Published var avoidHighway: Bool { didSet { ud.set(avoidHighway, forKey: "avoid_hw") } }
+
+    // MARK: - 车牌与限行
+
+    /// 高德 AMapNaviVehicleInfo.type：0 燃油客车 / 2 纯电动客车 / 4 插电式混动客车
+    struct VehicleType: Identifiable {
+        let code: Int
+        let name: String
+        var id: Int { code }
+    }
+    static let vehicleTypes: [VehicleType] = [
+        VehicleType(code: 0, name: "燃油客车"),
+        VehicleType(code: 2, name: "纯电客车"),
+        VehicleType(code: 4, name: "插混客车")
+    ]
+    /// 民用车牌的省份简称（设置页里点一下就能换省份，不用切中文键盘）
+    static let plateProvinces: [String] = "京津冀晋蒙辽吉黑沪苏浙皖闽赣鲁豫鄂湘粤桂琼渝川贵云藏陕甘青宁新".map { String($0) }
+
+    /// 车牌清洗：去掉空格、标点，字母统一大写（"京a·12345" → "京A12345"）
+    static func normalizedPlate(_ raw: String) -> String {
+        String(raw.uppercased().filter { $0.isLetter || $0.isNumber }.prefix(9))
+    }
+    /// 普通车牌 7 位、新能源 8 位：省份简称 + 发牌机关字母 + 5/6 位序号
+    static func plateValid(_ p: String) -> Bool {
+        guard p.count == 7 || p.count == 8 else { return false }
+        let cs = Array(p)
+        guard plateProvinces.contains(String(cs[0])) else { return false }
+        guard let s = cs[1].unicodeScalars.first, (65...90).contains(Int(s.value)) else { return false }
+        return cs.dropFirst(2).allSatisfy { $0.isLetter || $0.isNumber }
+    }
+
+    @Published var plateNumber: String { didSet { ud.set(plateNumber, forKey: "vehicle_plate") } }
+    @Published var avoidRestriction: Bool { didSet { ud.set(avoidRestriction, forKey: "avoid_restriction") } }
+    @Published var vehicleType: Int { didSet { ud.set(vehicleType, forKey: "vehicle_type") } }
+
+    /// 真正交给高德的车牌（已清洗）
+    var plateInUse: String { Settings.normalizedPlate(plateNumber) }
+    /// 限行规避现在是否生效
+    var restrictionActive: Bool { avoidRestriction && Settings.plateValid(plateInUse) }
+    /// 界面上一句话显示当前状态
+    var plateSummary: String {
+        guard Settings.plateValid(plateInUse) else { return "未设置车牌" }
+        return avoidRestriction ? "\(plateInUse) · 避开限行" : "\(plateInUse) · 未开启"
+    }
+    /// 车牌 / 车型 / 开关改完调用：更新高德车辆信息，已经算过路线就重算一次
+    func applyVehicleSettings() {
+        NaviBridge.shared.applyVehicleInfo()
+        NaviBridge.shared.replanIfNeeded()
+    }
     @Published var curve: Bool { didSet { ud.set(curve, forKey: "map_curve"); BleLink.shared.send(curve ? "#Q,1" : "#Q,0") } }
     @Published var duck: Bool { didSet { ud.set(duck, forKey: "voice_duck") } }
     /// iOS v0.6 导航播报静音（导航画面上的按钮，下次还记得）
@@ -170,6 +218,9 @@ final class Settings: ObservableObject {
         if let m = ud.object(forKey: "night_mode") as? Int { nightMode = m }
         else { nightMode = ud.bool(forKey: "night") ? 2 : 0 }       // 老版本的“夜间配色”开关：开 = 一直夜间
         avoidHighway = ud.object(forKey: "avoid_hw") as? Bool ?? true
+        plateNumber = ud.string(forKey: "vehicle_plate") ?? ""
+        avoidRestriction = ud.object(forKey: "avoid_restriction") as? Bool ?? true
+        vehicleType = ud.object(forKey: "vehicle_type") as? Int ?? 0
         curve = ud.bool(forKey: "map_curve")
         duck = ud.object(forKey: "voice_duck") as? Bool ?? true
         voiceMuted = ud.bool(forKey: "nav_muted")

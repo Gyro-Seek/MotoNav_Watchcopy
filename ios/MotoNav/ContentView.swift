@@ -31,6 +31,7 @@ struct ContentView: View {
     @State private var showNavi = false
     @State private var showDebug = false
     @State private var showKeys = false                 // iOS v0.7 填写地图 Key 页面
+    @State private var showPlate = false                // 车牌 / 限行设置页
     private static var keyPrompted = false              // 这次打开 App 已经提醒过填 key 了
     @State private var shareBusy = false
     @State private var shareStatus = ""
@@ -99,6 +100,7 @@ struct ContentView: View {
         .sheet(isPresented: $showRides) { NavigationView { RideHistoryView() } }
         .fullScreenCover(isPresented: $showNavi) { NaviScreen() }
         .sheet(isPresented: $showKeys) { KeySetupView() }
+        .sheet(isPresented: $showPlate) { PlateSetupView() }
         .onAppear {                                    // iOS v0.7 打开 App 时，高德或高德 key 没填就提醒一次
             if !ContentView.keyPrompted && settings.keysMissing {
                 ContentView.keyPrompted = true
@@ -483,9 +485,12 @@ struct ContentView: View {
                     }
                 }
             }
-            Toggle("不走高速", isOn: $settings.avoidHighway)
-                .font(.caption).foregroundColor(.white).tint(ContentView.pink)
-                .onChange(of: settings.avoidHighway) { _ in navi.replan() }
+            VStack(spacing: 6) {
+                Toggle("不走高速", isOn: $settings.avoidHighway)
+                    .font(.caption).foregroundColor(.white).tint(ContentView.pink)
+                    .onChange(of: settings.avoidHighway) { _ in navi.replan() }
+                plateRow
+            }
             PillButton(title: "开始导航", color: ContentView.pink, enabled: navi.routeReady) {
                 navi.start(emulate: false); showNavi = true
             }
@@ -496,6 +501,25 @@ struct ContentView: View {
                     .disabled(!navi.routeReady)
             }
         }
+    }
+
+    /// 路线面板里的车牌 / 限行状态：点一下去设置，改完立刻按新车牌重算
+    private var plateRow: some View {
+        Button { showPlate = true } label: {
+            HStack(spacing: 8) {
+                Image(systemName: "car.fill").font(.caption)
+                    .foregroundColor(settings.restrictionActive ? ContentView.cyan : ContentView.sub)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(settings.restrictionActive ? "已避开限行" : "添加车牌，避开限行")
+                        .font(.caption).foregroundColor(.white)
+                    Text(settings.plateSummary).font(.caption2).foregroundColor(ContentView.sub)
+                }
+                Spacer(minLength: 4)
+                Image(systemName: "chevron.right").font(.caption2).foregroundColor(ContentView.sub)
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
     }
 
     /// 程序化改搜索框文字：值真的变了才压住下一次实时检索，避免抑制标记残留
@@ -851,7 +875,7 @@ struct ContentView: View {
         if viaManager { return min(geo.size.height * 0.64, 480) }
         if addingVia { return min(geo.size.height * 0.52, 400) }
         if homeStage == .place { return 200 }
-        if homeStage == .routes { return min(geo.size.height * 0.48, 350) }
+        if homeStage == .routes { return min(geo.size.height * 0.52, 400) }
         return hasSearchContent ? min(geo.size.height * 0.52, 400) : 122
     }
 
@@ -971,6 +995,16 @@ struct ContentView: View {
                         .background(RoundedRectangle(cornerRadius: 12).fill(Self.cyan.opacity(0.8)))
                 }
             }
+            Button { showPlate = true } label: {
+                HStack {
+                    Image(systemName: "car.fill").foregroundColor(Self.cyan)
+                    Text("车牌与限行").font(.subheadline).foregroundColor(.white)
+                    Spacer()
+                    Text(settings.plateSummary).font(.caption).foregroundColor(Self.sub).lineLimit(1)
+                    Image(systemName: "chevron.right").font(.caption).foregroundColor(Self.sub)
+                }
+            }
+            .buttonStyle(.plain)
         }
     }
 
@@ -1407,5 +1441,135 @@ final class HomeMapDelegate: NSObject {
             r.strokeColor = UIColor(white: 0.6, alpha: 0.7); r.lineWidth = 6
         }
         return r
+    }
+}
+
+// MARK: - 车牌与限行设置
+
+/// 填一次车牌，之后每次点「路线」都会把车牌交给高德，自动规避当日限行。
+/// 高德接口：AMapNaviVehicleInfo.vehicleId + isETARestriction + type → AMapNaviDriveManager.setVehicleInfo()
+struct PlateSetupView: View {
+    @ObservedObject private var settings = Settings.shared
+    @Environment(\.presentationMode) private var presentationMode
+    @State private var draft = ""
+    @State private var vehicleType = 0
+    @State private var avoid = true
+    @State private var note = ""
+
+    var body: some View {
+        NavigationView {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 14) {
+                    CardView {
+                        Text("车牌号").foregroundColor(.white).bold()
+                        TextField("例如 京A12345 / 京AD12345", text: $draft)
+                            .textFieldStyle(.plain)
+                            .font(.title3.monospaced())
+                            .foregroundColor(.white)
+                            .padding(12)
+                            .background(RoundedRectangle(cornerRadius: 10).fill(ContentView.bg))
+                            .overlay(RoundedRectangle(cornerRadius: 10).stroke(ContentView.stroke, lineWidth: 1))
+                        Text("普通车牌 7 位、新能源车牌 8 位；会自动去掉空格和标点、把字母转成大写。")
+                            .font(.caption).foregroundColor(ContentView.sub)
+                        Text("点一下选省份，后面直接填字母和数字").font(.caption2).foregroundColor(ContentView.sub)
+                        provinceChips
+                    }
+
+                    CardView {
+                        Text("车辆类型").foregroundColor(.white).bold()
+                        HStack(spacing: 8) {
+                            ForEach(Settings.vehicleTypes) { v in
+                                Button { vehicleType = v.code } label: {
+                                    Text(v.name).font(.caption)
+                                        .foregroundColor(vehicleType == v.code ? .white : ContentView.sub)
+                                        .frame(maxWidth: .infinity, minHeight: 36)
+                                        .background(Capsule().fill(vehicleType == v.code ? ContentView.pink : ContentView.bg))
+                                }
+                                .buttonStyle(.plain)
+                            }
+                        }
+                        Text("新能源车牌请选「纯电客车」或「插混客车」，否则尾号限行可能判断不准。")
+                            .font(.caption).foregroundColor(ContentView.sub)
+                    }
+
+                    CardView {
+                        Toggle("规划路线时避开限行", isOn: $avoid)
+                            .font(.subheadline).foregroundColor(.white).tint(ContentView.pink)
+                        Text("开启后，每次规划路线都会把车牌传给高德，绕开当日尾号限行、外地牌限行等路段；改完已有路线会立刻重算。")
+                            .font(.caption).foregroundColor(ContentView.sub)
+                        Text("限行数据以高德为准。各地禁摩规则与汽车尾号限行不同，本功能按小客车规则处理，请以现场交通标志为准。")
+                            .font(.caption2).foregroundColor(ContentView.sub)
+                    }
+
+                    if !note.isEmpty { Text(note).font(.caption).foregroundColor(.orange) }
+
+                    if !settings.plateNumber.isEmpty {
+                        Button {
+                            settings.plateNumber = ""
+                            settings.applyVehicleSettings()
+                            presentationMode.wrappedValue.dismiss()
+                        } label: {
+                            Text("清除车牌").font(.subheadline).foregroundColor(.orange)
+                        }
+                    }
+                }
+                .padding(16)
+            }
+            .background(ContentView.bg.ignoresSafeArea())
+            .navigationTitle("车牌与限行")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) {
+                    Button("取消") { presentationMode.wrappedValue.dismiss() }
+                        .foregroundColor(ContentView.sub)
+                }
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("保存") { save() }.foregroundColor(ContentView.pink)
+                }
+            }
+        }
+        .onAppear {
+            draft = settings.plateNumber
+            vehicleType = settings.vehicleType
+            avoid = settings.avoidRestriction
+        }
+    }
+
+    private var currentProvince: String {
+        guard let f = Settings.normalizedPlate(draft).first else { return "" }
+        return String(f)
+    }
+
+    /// 省份简称快捷按钮：点一下替换车牌首字，省得切中文键盘
+    private var provinceChips: some View {
+        LazyVGrid(columns: [GridItem(.adaptive(minimum: 34), spacing: 6)], spacing: 6) {
+            ForEach(Settings.plateProvinces, id: \.self) { p in
+                Button {
+                    let body = Settings.normalizedPlate(draft)
+                    let tail = Settings.plateProvinces.contains(currentProvince) ? String(body.dropFirst()) : body
+                    draft = p + tail
+                } label: {
+                    Text(p).font(.subheadline)
+                        .foregroundColor(currentProvince == p ? .white : ContentView.sub)
+                        .frame(maxWidth: .infinity, minHeight: 30)
+                        .background(RoundedRectangle(cornerRadius: 7)
+                            .fill(currentProvince == p ? ContentView.pink : ContentView.bg))
+                }
+                .buttonStyle(.plain)
+            }
+        }
+    }
+
+    private func save() {
+        let p = Settings.normalizedPlate(draft)
+        if !p.isEmpty && !Settings.plateValid(p) {
+            note = "车牌格式不对：省份简称 + 发牌机关字母 + 5 或 6 位序号，例如 京A12345、京AD12345"
+            return
+        }
+        settings.plateNumber = p
+        settings.vehicleType = vehicleType
+        settings.avoidRestriction = avoid
+        settings.applyVehicleSettings()
+        presentationMode.wrappedValue.dismiss()
     }
 }

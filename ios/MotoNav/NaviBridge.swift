@@ -198,6 +198,7 @@ final class NaviBridge: NSObject, ObservableObject {
         m.setMultipleRouteNaviMode(true)
         m.updateCameraInfo = true
         m.updateTrafficInfo = true
+        applyVehicleInfo()                          // 车牌 / 限行：算路前把车牌交给高德
     }
 
     /// Relinquish planning callbacks while independent guidance reads static camera metadata.
@@ -209,6 +210,29 @@ final class NaviBridge: NSObject, ObservableObject {
         sessionCallbacks=nil;manager.delegate=nil;attached=false
         calculating=false;routeReady=false;routeOptions=[];selectedRouteID = -1
         return true
+    }
+
+    // MARK: - 车牌与限行
+
+    /// 算路前把车牌交给高德：AMapNaviVehicleInfo 的 vehicleId + isETARestriction + type。
+    /// 只有「车牌合法 + 开了避开限行」才把车牌写进去；关掉开关或删掉车牌时传空车牌并关掉限行开关，
+    /// 上一次算路留下的车辆信息就不会继续生效（不传 nil，兼容各版本 SDK 的参数声明）。
+    /// 高德拿到车牌后会在算路时规避当日尾号限行、外地牌限行等路段。
+    func applyVehicleInfo() {
+        let s = Settings.shared
+        let plate = s.plateInUse
+        let active = s.avoidRestriction && Settings.plateValid(plate)
+        let info = AMapNaviVehicleInfo()
+        info.vehicleId = active ? plate : ""
+        info.isETARestriction = active
+        info.type = s.vehicleType
+        _ = manager.setVehicleInfo(info)
+    }
+
+    /// 车牌 / 车型 / 限行开关改了：已经算过路线就按新车牌重算一次
+    func replanIfNeeded() {
+        guard !destLat.isNaN, !navigating, !WebMotorSession.shared.running else { return }
+        replan()
     }
 
     // MARK: - 路线和导航
@@ -280,6 +304,7 @@ final class NaviBridge: NSObject, ObservableObject {
     /// 按上次的目的地重新规划（比如切换了“不走高速”）
     func replan(retry: Int = 1) {
         guard !destLat.isNaN, !navigating, !WebMotorSession.shared.running else { return }
+        applyVehicleInfo()                          // 车牌 / 限行设置可能刚改过
         planFailed = false
         MapFeeder.shared.onNaviEnd()
         if cruising { stopCruise() }
@@ -1012,6 +1037,9 @@ extension NaviBridge {
         }
         routeOptions = opts
         info = opts.count > 1 ? "规划好了 \(opts.count) 条路线，点卡片选一条" : "路线规划好了"
+        if Settings.shared.restrictionActive {
+            info += " · 已按 \(Settings.shared.plateInUse) 避开限行"
+        }
         if let f = opts.first { select(routeID: f.id) }
     }
 
