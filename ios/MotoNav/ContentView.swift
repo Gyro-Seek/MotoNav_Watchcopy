@@ -92,20 +92,9 @@ struct ContentView: View {
             // 冷启动时通知可能比界面先到，补一次
             suppressAutoSearch = false
             flushPendingShare()
-            // 圆屏：改版后原「圆屏设置」页不再常驻，这里补一次连接。
-            // connect() 会把 wantConnected 重新置 true 并清零重试计数，
-            // 可修复「误触断开后再也回不来」和蓝牙权限弹窗造成的冷启动时序问题。
-            let link = ble
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
-                if !link.isReady { link.connect() }
-            }
         }
         .onChange(of: scenePhase) { phase in
-            if phase == .active {
-                flushPendingShare()
-                // 回到前台补一次连接：断开了 / 手动断开过都能自动恢复
-                if !ble.isReady { ble.connect() }
-            }
+            if phase == .active { flushPendingShare() }
         }
         // 输入即检索：350ms 防抖，SearchService 自带关键词缓存，避免每个字母都请求高德
         .onChange(of: query) { t in
@@ -195,8 +184,6 @@ struct ContentView: View {
                 Circle().fill(ble.isReady ? Color.green : Color.orange).frame(width: 10, height: 10)
                 Text("圆屏").foregroundColor(.white).bold()
                 Spacer()
-                Button("重新搜索") { rescanRoundScreen() }
-                    .font(.caption).foregroundColor(ContentView.sub)
                 Button(ble.isReady ? "断开" : "连接") { ble.isReady ? ble.disconnect() : ble.connect() }
                     .foregroundColor(ContentView.cyan)
             }
@@ -215,47 +202,6 @@ struct ContentView: View {
             }
             Text("小地图：\(map.shortStatus) · 高德 · \(Settings.themeName(settings.theme))")
                 .font(.caption).foregroundColor(ContentView.sub)
-        }
-    }
-
-    /// 未连接时首页顶部的细提示条：改版后「圆屏设置」不再常驻，状态必须看得见。
-    /// 连上后自动消失，不占首页空间（和苹果地图的定位 / 网络提示同一层级）。
-    private var bleStatusPill: some View {
-        HStack(spacing: 8) {
-            Circle().fill(Color.orange).frame(width: 8, height: 8)
-            Text(ble.status.isEmpty ? "圆屏未连接" : ble.status)
-                .font(.caption)
-                .foregroundColor(.white)
-                .lineLimit(1)
-            Button("重试") { ble.connect() }
-                .font(.caption.weight(.semibold))
-                .foregroundColor(ContentView.cyan)
-                .buttonStyle(.plain)
-            Button { rescanRoundScreen() } label: {
-                Image(systemName: "arrow.clockwise")
-                    .font(.caption)
-                    .foregroundColor(ContentView.sub)
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel("重新搜索圆屏")
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
-        .background(Capsule().fill(ContentView.card.opacity(0.94)))
-        .overlay(Capsule().stroke(Color.white.opacity(0.16), lineWidth: 1))
-        .shadow(color: Color.black.opacity(0.25), radius: 6, y: 3)
-    }
-
-    /// 圆屏重刷固件 / 换设备后，BleLink 会按 UserDefaults 里缓存的 UUID 一直连旧设备，
-    /// 表现为「怎么都连不上」。先断开，等 didDisconnectPeripheral 走完，
-    /// 再清掉 ble_peripheral，让 connect() 重新走 scanForPeripherals 分支。
-    private func rescanRoundScreen() {
-        let link = ble
-        link.disconnect()
-        UserDefaults.standard.removeObject(forKey: "ble_peripheral")
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
-            UserDefaults.standard.removeObject(forKey: "ble_peripheral")
-            link.connect()
         }
     }
 
@@ -948,13 +894,6 @@ struct ContentView: View {
                 }
                 homeDrawer(height: panelHeight(geo))
             }
-            .overlay(alignment: .topLeading) {
-                if !ble.isReady {
-                    bleStatusPill
-                        .padding(.top, 14)
-                        .padding(.leading, 16)
-                }
-            }
         }
     }
 
@@ -975,23 +914,11 @@ struct ContentView: View {
             } label: {
                 MapGlassButton(icon: "binoculars.fill", active: navi.cruising)
             }
-            Menu {
-                if ble.isReady {
-                    Button(role: .destructive) { ble.disconnect() } label: {
-                        Label("断开圆屏", systemImage: "xmark.circle")
-                    }
-                } else {
-                    Button { ble.connect() } label: {
-                        Label("连接圆屏", systemImage: "link")
-                    }
-                }
-                Button { rescanRoundScreen() } label: {
-                    Label("重新搜索圆屏（换过固件 / 设备时用）", systemImage: "arrow.clockwise")
-                }
+            Button {
+                if ble.isReady { ble.disconnect() } else { ble.connect() }
             } label: {
                 MapGlassButton(icon: "dot.radiowaves.left.and.right", active: ble.isReady, tint: Color.green)
             }
-            .accessibilityLabel("圆屏连接")
         }
     }
 
@@ -1171,9 +1098,6 @@ struct ContentView: View {
                     }
                 }
                 Section(header: Text("圆屏")) {
-                    Button { rescanRoundScreen() } label: {
-                        settingsRow("重新搜索圆屏", "清掉旧设备记录并重新扫描", "arrow.clockwise", Color.orange)
-                    }
                     NavigationLink(destination: AnyView(settingsDetail(.screen))) {
                         settingsRow("圆屏设置", ble.isReady ? ble.status : "未连接", "gearshape", ContentView.cyan)
                     }
