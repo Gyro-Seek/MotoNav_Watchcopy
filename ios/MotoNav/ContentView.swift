@@ -27,7 +27,7 @@ struct ContentView: View {
     @AppStorage("voice_rate") private var voiceRate = Double(AVSpeechUtteranceDefaultSpeechRate)
     @AppStorage("voice_pitch") private var voicePitch = 1.0
     @AppStorage("voice_id") private var voiceID = ""
-    @AppStorage("map_appearance") private var mapAppearance = 0   // 0 自动 / 1 标准 / 2 夜间 / 3 卫星
+    @AppStorage("map_appearance") private var mapAppearance = 0   // 0 自动 / 1 标准 / 2 夜间（设置里选）
 
     @State private var query = ""
     @State private var dest: SearchService.Place?
@@ -56,6 +56,11 @@ struct ContentView: View {
     @State private var suppressAutoSearch = false      // 程序化改 query 时不触发实时检索
     @State private var searchWork: DispatchWorkItem? = nil
     @State private var keyboardHeight: CGFloat = 0     // 键盘高度：把搜索面板顶到键盘上方
+    @AppStorage("map_layer") private var mapLayer = 0 // 0 地图 / 1 驾车（实时路况） / 2 卫星
+    @State private var mapRotated = false              // 地图被手动旋转、不是北向上
+    @State private var northToken = 0                  // 左下角「回正」按钮
+    @State private var poiSelected = false             // 地点来自点按地图（点空白处可收起）
+    @State private var bleHint = ""                    // 圆屏重新搜索提示
 
     // 设置中心自己的弹层：和首页弹层分属不同视图层级，避免 sheet 套 sheet 被系统吞掉
     @State private var hubPlate = false
@@ -64,12 +69,30 @@ struct ContentView: View {
     @State private var hubWeb = false
     @State private var hubMode: IndependentMode = .motorcycle
 
-    static let bg = Color(red: 0.055, green: 0.04, blue: 0.08)
-    static let card = Color(red: 0.10, green: 0.08, blue: 0.14)
-    static let stroke = Color(red: 0.17, green: 0.14, blue: 0.22)
-    static let pink = Color(red: 1.0, green: 0.31, blue: 0.71)
-    static let cyan = Color(red: 0.26, green: 0.88, blue: 0.94)
-    static let sub = Color(red: 0.62, green: 0.58, blue: 0.67)
+    // 苹果地图式浅色玻璃 / 深色玻璃：按 Settings.uiLight 实时取色。
+    // uiLight 由设置里的「自动（日出日落）/ 浅色 / 深色」算出来，App 根视图同步切 preferredColorScheme。
+    static var bg: Color {
+        Settings.shared.uiLight ? Color(red: 0.94, green: 0.95, blue: 0.97) : Color(red: 0.055, green: 0.04, blue: 0.08)
+    }
+    static var card: Color {
+        Settings.shared.uiLight ? Color.white.opacity(0.74) : Color(red: 0.10, green: 0.08, blue: 0.14)
+    }
+    static var stroke: Color {
+        Settings.shared.uiLight ? Color.black.opacity(0.10) : Color(red: 0.17, green: 0.14, blue: 0.22)
+    }
+    static var sub: Color {
+        Settings.shared.uiLight ? Color(white: 0.44) : Color(red: 0.62, green: 0.58, blue: 0.67)
+    }
+    /// 正文：浅色底用近黑，深色底用白
+    static var ink: Color {
+        Settings.shared.uiLight ? Color(white: 0.11) : Color.white
+    }
+    static var pink: Color {
+        Settings.shared.uiLight ? Color(red: 0.91, green: 0.15, blue: 0.48) : Color(red: 1.0, green: 0.31, blue: 0.71)
+    }
+    static var cyan: Color {
+        Settings.shared.uiLight ? Color(red: 0.0, green: 0.36, blue: 0.86) : Color(red: 0.26, green: 0.88, blue: 0.94)
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -92,9 +115,18 @@ struct ContentView: View {
             // 冷启动时通知可能比界面先到，补一次
             suppressAutoSearch = false
             flushPendingShare()
+            // 圆屏：disconnect() 会把自动重连标志关掉；冷启动补一次
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                let b = BleLink.shared
+                if !b.isReady { b.connect() }
+            }
         }
         .onChange(of: scenePhase) { phase in
-            if phase == .active { flushPendingShare() }
+            if phase == .active {
+                flushPendingShare()
+                let b = BleLink.shared
+                if !b.isReady { b.connect() }
+            }
         }
         // 输入即检索：350ms 防抖，SearchService 自带关键词缓存，避免每个字母都请求高德
         .onChange(of: query) { t in
@@ -160,7 +192,7 @@ struct ContentView: View {
                     Button("回到导航") {
                         if independent.running { showWebMotor=true } else { showNavi=true }
                     }.foregroundColor(Self.pink)
-                }.padding(12).background(Self.card).foregroundColor(.white)
+                }.padding(12).background(Self.card).foregroundColor(ContentView.ink)
             }
         }
     }
@@ -182,7 +214,7 @@ struct ContentView: View {
         CardView {
             HStack {
                 Circle().fill(ble.isReady ? Color.green : Color.orange).frame(width: 10, height: 10)
-                Text("圆屏").foregroundColor(.white).bold()
+                Text("圆屏").foregroundColor(ContentView.ink).bold()
                 Spacer()
                 Button(ble.isReady ? "断开" : "连接") { ble.isReady ? ble.disconnect() : ble.connect() }
                     .foregroundColor(ContentView.cyan)
@@ -192,11 +224,13 @@ struct ContentView: View {
             if ble.isReady, Date().timeIntervalSince(ble.statAt) < 10, !ble.screenFps.isEmpty {
                 Text("小地图 \(ble.screenFps) 帧/秒").font(.footnote).foregroundColor(ContentView.sub)
             }
+            Button("重新搜索圆屏") { rescanRoundScreen() }
+                .font(.caption).foregroundColor(ContentView.cyan)
             if navi.navigating {
                 Text("导航中：\(navi.uiDir) \(navi.uiDist) 米 · \(navi.uiSpeed) km/h").font(.footnote).foregroundColor(ContentView.cyan)
                 if navi.uiRemainM > 0 {
                     Text("剩余 \(NaviBridge.distText(navi.uiRemainM)) · 约 \(NaviBridge.durText(navi.uiRemainS)) · \(ContentView.etaText(navi.uiRemainS)) 到达")
-                        .font(.footnote).foregroundColor(.white)
+                        .font(.footnote).foregroundColor(ContentView.ink)
                 }
                 Button("回到导航画面") { showNavi = true }.foregroundColor(ContentView.pink)
             }
@@ -215,15 +249,15 @@ struct ContentView: View {
                         .frame(width: 22, height: 32)
                 }
             }
-            Image(systemName: "magnifyingglass").foregroundColor(Self.sub)
+            Image(systemName: "magnifyingglass").foregroundColor(ContentView.sub)
             TextField(addingVia ? "搜索途经点（比如加油站）" : "搜索地点、地址", text: $query)
                 .textFieldStyle(.plain)
-                .foregroundColor(.white)
+                .foregroundColor(ContentView.ink)
                 .submitLabel(.search)
                 .onSubmit { submitSearch() }
             if !query.isEmpty || homeStage != .idle {
                 Button { resetHome() } label: {
-                    Image(systemName: "xmark.circle.fill").foregroundColor(Self.sub)
+                    Image(systemName: "xmark.circle.fill").foregroundColor(ContentView.sub)
                 }
             }
             if keyboardHeight > 0 {
@@ -233,14 +267,14 @@ struct ContentView: View {
             Button { hideKeyboard(); showSettings = true } label: {
                 Image(systemName: "gearshape.fill")
                     .font(.system(size: 16))
-                    .foregroundColor(.white)
+                    .foregroundColor(ContentView.ink)
                     .frame(width: 32, height: 32)
-                    .background(Circle().fill(Self.stroke.opacity(0.95)))
+                    .background(Circle().fill(ContentView.stroke.opacity(0.55)))
             }
             .accessibilityLabel("设置")
         }
         .padding(.horizontal, 12).padding(.vertical, 8)
-        .background(RoundedRectangle(cornerRadius: 14).fill(Self.bg))
+        .background(RoundedRectangle(cornerRadius: 14).fill(ContentView.card.opacity(0.86)))
     }
 
     // MARK: 首页抽屉内容：按「搜索 / 地点 / 路线」三个阶段切换
@@ -260,7 +294,7 @@ struct ContentView: View {
             Button { choose(p) } label: {
                 HStack(alignment: .center, spacing: 8) {
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(p.name).foregroundColor(.white)
+                        Text(p.name).foregroundColor(ContentView.ink)
                         Text(p.address).font(.caption).foregroundColor(ContentView.sub).lineLimit(1)
                     }
                     Spacer(minLength: 4)
@@ -309,7 +343,7 @@ struct ContentView: View {
         Button { choose(p) } label: {
             HStack(alignment: .center, spacing: 8) {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(p.name).foregroundColor(.white).lineLimit(1)
+                    Text(p.name).foregroundColor(ContentView.ink).lineLimit(1)
                     if !p.address.isEmpty {
                         Text(p.address).font(.caption).foregroundColor(ContentView.sub).lineLimit(1)
                     }
@@ -340,7 +374,7 @@ struct ContentView: View {
                 .font(.subheadline).foregroundColor(ContentView.cyan)
             }
             Spacer()
-            Text("途经点").font(.headline).foregroundColor(.white)
+            Text("途经点").font(.headline).foregroundColor(ContentView.ink)
             Spacer()
             Button("完成") { closeViaManager() }
                 .font(.subheadline).foregroundColor(ContentView.pink)
@@ -354,7 +388,7 @@ struct ContentView: View {
             CardView {
                 HStack(spacing: 8) {
                     Image(systemName: "location.fill").foregroundColor(ContentView.cyan)
-                    Text("我的位置").foregroundColor(.white).font(.subheadline)
+                    Text("我的位置").foregroundColor(ContentView.ink).font(.subheadline)
                     Spacer()
                     Text("起点").font(.caption2).foregroundColor(ContentView.sub)
                 }
@@ -363,7 +397,7 @@ struct ContentView: View {
             CardView {
                 HStack(spacing: 8) {
                     Image(systemName: "flag.fill").foregroundColor(ContentView.pink)
-                    Text(dest?.name ?? "目的地").foregroundColor(.white).font(.subheadline).lineLimit(1)
+                    Text(dest?.name ?? "目的地").foregroundColor(ContentView.ink).font(.subheadline).lineLimit(1)
                     Spacer()
                     Text("终点").font(.caption2).foregroundColor(ContentView.sub)
                 }
@@ -403,7 +437,7 @@ struct ContentView: View {
     private func viaRow(_ v: NaviBridge.Via) -> some View {
         HStack(spacing: 8) {
             Image(systemName: "circle.fill").font(.system(size: 6)).foregroundColor(ContentView.cyan)
-            Text(v.name).foregroundColor(.white).font(.subheadline).lineLimit(1)
+            Text(v.name).foregroundColor(ContentView.ink).font(.subheadline).lineLimit(1)
             Spacer(minLength: 4)
             Button { navi.removeVia(id: v.id) } label: {
                 Image(systemName: "minus.circle.fill").foregroundColor(.red)
@@ -414,25 +448,30 @@ struct ContentView: View {
         .listRowInsets(EdgeInsets(top: 3, leading: 10, bottom: 3, trailing: 10))
     }
 
-    /// 地点态（苹果地图式地点卡）：大标题 + 地址 + 底部主要动作
+    /// 地点态（苹果地图式地点卡）：大标题 + 地址 + 距离 + 路线主按钮
     private var placeCard: some View {
         SheetBlock {
             if let d = dest {
                 HStack(alignment: .top) {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text(d.name).font(.title3.bold()).foregroundColor(.white).lineLimit(2)
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text(d.name).font(.title2.bold()).foregroundColor(ContentView.ink).lineLimit(2)
                         if !d.address.isEmpty {
                             Text(d.address).font(.footnote).foregroundColor(ContentView.sub).lineLimit(2)
                         }
-                        if let dist = distanceTo(d) {
-                            Text(dist).font(.caption2).foregroundColor(ContentView.sub)
+                        HStack(spacing: 6) {
+                            if let dist = distanceTo(d) {
+                                Text(dist).font(.caption).foregroundColor(ContentView.sub)
+                            }
+                            if poiSelected {
+                                Text("地图上的地点").font(.caption2).foregroundColor(ContentView.sub)
+                            }
                         }
                     }
                     Spacer(minLength: 8)
                     Button { resetHome() } label: {
                         Image(systemName: "xmark").font(.caption).foregroundColor(ContentView.sub)
                             .frame(width: 28, height: 28)
-                            .background(Circle().fill(ContentView.bg))
+                            .background(Circle().fill(ContentView.stroke.opacity(0.45)))
                     }
                 }
                 HStack(spacing: 10) {
@@ -440,15 +479,17 @@ struct ContentView: View {
                         Label("收藏", systemImage: "star")
                             .font(.subheadline).foregroundColor(ContentView.cyan)
                             .frame(maxWidth: .infinity, minHeight: 46)
-                            .background(RoundedRectangle(cornerRadius: 12).fill(ContentView.bg))
+                            .background(RoundedRectangle(cornerRadius: 12).fill(ContentView.stroke.opacity(0.35)))
                     }
                     Button { startRoutePlanning() } label: {
                         Label("路线", systemImage: "arrow.triangle.turn.up.right.diamond")
                             .font(.headline).foregroundColor(.white)
                             .frame(maxWidth: .infinity, minHeight: 46)
-                            .background(Capsule().fill(ContentView.pink))
+                            .background(Capsule().fill(ContentView.cyan))
                     }
                 }
+                Text("上滑面板看更多；点地图空白处可收起")
+                    .font(.caption2).foregroundColor(ContentView.sub)
             }
         }
     }
@@ -458,7 +499,7 @@ struct ContentView: View {
         SheetBlock {
             HStack(alignment: .top) {
                 VStack(alignment: .leading, spacing: 3) {
-                    Text(dest?.name ?? "路线").font(.title3.bold()).foregroundColor(.white).lineLimit(1)
+                    Text(dest?.name ?? "路线").font(.title3.bold()).foregroundColor(ContentView.ink).lineLimit(1)
                     Text("驾车 · 高德导航").font(.caption).foregroundColor(ContentView.sub)
                 }
                 Spacer(minLength: 8)
@@ -505,11 +546,12 @@ struct ContentView: View {
             }
             HStack(spacing: 12) {
                 Toggle("不走高速", isOn: $settings.avoidHighway)
-                    .font(.caption).foregroundColor(.white).tint(ContentView.pink)
+                    .font(.caption).foregroundColor(ContentView.ink).tint(ContentView.pink)
                     .onChange(of: settings.avoidHighway) { _ in navi.replan() }
                 Spacer(minLength: 4)
             }
             plateRow
+            restrictionRow
             PillButton(title: "开始导航", color: ContentView.pink, enabled: navi.routeReady) {
                 navi.start(emulate: false); showNavi = true
             }
@@ -518,6 +560,21 @@ struct ContentView: View {
                 Button("模拟导航") { navi.start(emulate: true); showNavi = true }
                     .font(.caption2).foregroundColor(ContentView.sub)
                     .disabled(!navi.routeReady)
+            }
+        }
+    }
+
+    /// 高德 SDK 本次算路真实返回的限行结论（AMapNaviRoute.restrictionInfo）
+    private var restrictionRow: some View {
+        Group {
+            if settings.restrictionActive {
+                HStack(alignment: .top, spacing: 8) {
+                    Image(systemName: navi.restrictionOK ? "checkmark.shield.fill" : "exclamationmark.shield.fill")
+                        .font(.caption).foregroundColor(navi.restrictionOK ? .green : .orange)
+                    Text(navi.restrictionSummary).font(.caption2).foregroundColor(ContentView.sub)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 0)
+                }
             }
         }
     }
@@ -543,15 +600,15 @@ struct ContentView: View {
         }
     }
 
-    /// 路线面板里的车牌 / 限行状态：点一下去设置，改完立刻按新车牌重算
+    /// 路线面板里的车辆 / 限行状态：点一下去「我的车辆」，改完立刻按新车牌重算
     private var plateRow: some View {
         Button { showPlate = true } label: {
             HStack(spacing: 8) {
                 Image(systemName: "car.fill").font(.caption)
                     .foregroundColor(settings.restrictionActive ? ContentView.cyan : ContentView.sub)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(settings.restrictionActive ? "已避开限行" : "添加车牌，避开限行")
-                        .font(.caption).foregroundColor(.white)
+                    Text(settings.restrictionActive ? "车辆与限行" : "添加车辆，避开限行")
+                        .font(.caption).foregroundColor(ContentView.ink)
                     Text(settings.plateSummary).font(.caption2).foregroundColor(ContentView.sub)
                 }
                 Spacer(minLength: 4)
@@ -598,6 +655,7 @@ struct ContentView: View {
         dest = nil; homeFocus = nil; homeStage = .idle
         sheetExpanded = false; addingVia = false; viaManager = false
         pendingSearchSubmit = false; autoStartNavi = false
+        poiSelected = false
     }
 
     /// 关闭按钮：完全回到首页空闲态
@@ -690,6 +748,7 @@ struct ContentView: View {
             return
         }
         dest = p
+        poiSelected = false
         setQuery(p.name)
         shareStatus = ""
         History.shared.add(p)
@@ -860,16 +919,21 @@ struct ContentView: View {
                     HomeMapView(
                         night: mapNight,
                         satellite: mapSatellite,
+                        traffic: mapTraffic,
                         focus: homeFocus,
                         focusToken: focusToken,
                         recenterToken: recenterToken,
                         overviewToken: overviewToken,
+                        northToken: northToken,
                         routes: (homeStage == .routes || addingVia) ? navi.routeOptions : [],
                         selectedRouteID: navi.selectedRouteID,
                         ghost: shareGhost,
                         dest: (homeStage == .routes || addingVia) ? navi.destCoord : nil,
                         vias: viaCoords,
-                        bottomInset: panelHeight(geo) + keyboardHeight
+                        bottomInset: panelHeight(geo) + keyboardHeight,
+                        onRotation: { rotated in mapRotated = rotated },
+                        onPoiTap: { name, coord in selectMapPoi(name: name, coord: coord) },
+                        onBlankTap: { if poiSelected && homeStage == .place { resetHome() } }
                     )
                     .ignoresSafeArea()
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -887,51 +951,58 @@ struct ContentView: View {
                         .padding(.trailing, 16)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .overlay(alignment: .bottomLeading) {
+                    if mapRotated {
+                        Button { northToken += 1 } label: {
+                            MapGlassButton(icon: "location.north.line.fill")
+                        }
+                        .accessibilityLabel("地图回正，北向上")
+                        .padding(.leading, 16)
+                        .padding(.bottom, panelHeight(geo) + keyboardHeight + 14)
+                        .transition(.opacity)
+                    }
+                }
                 .overlay(alignment: .bottomTrailing) {
                     recenterButton
                         .padding(.trailing, 16)
                         .padding(.bottom, panelHeight(geo) + keyboardHeight + 14)
                 }
                 homeDrawer(height: panelHeight(geo))
+                    .ignoresSafeArea(edges: .bottom)
             }
         }
     }
 
-    /// 地图右上角悬浮控件（苹果地图式圆钮）
+    /// 右上角地图按钮：苹果地图式「地图 / 驾车（路况） / 卫星」三选一。
+    /// 界面深浅、标准 / 夜间地图配色统一放到设置里，默认自动跟随日出日落。
     private var mapControls: some View {
-        VStack(spacing: 10) {
-            Menu {
-                Button { mapAppearance = 0 } label: { Label("自动（跟随昼夜）", systemImage: "clock") }
-                Button { mapAppearance = 1 } label: { Label("标准地图", systemImage: "sun.max") }
-                Button { mapAppearance = 2 } label: { Label("夜间地图", systemImage: "moon") }
-                Button { mapAppearance = 3 } label: { Label("卫星图", systemImage: "globe") }
-            } label: {
-                MapGlassButton(icon: "map", active: mapAppearance != 0)
+        Menu {
+            Button { mapLayer = 0 } label: {
+                Label("地图", systemImage: mapLayer == 0 ? "checkmark" : "map")
             }
-            Button {
-                if navi.cruising { navi.stopCruise() }
-                else if !needAmapKey() { cruiseNote = navi.startCruise() ?? "" }
-            } label: {
-                MapGlassButton(icon: "binoculars.fill", active: navi.cruising)
+            Button { mapLayer = 1 } label: {
+                Label("驾车（实时路况）", systemImage: mapLayer == 1 ? "checkmark" : "car.fill")
             }
-            Button {
-                if ble.isReady { ble.disconnect() } else { ble.connect() }
-            } label: {
-                MapGlassButton(icon: "dot.radiowaves.left.and.right", active: ble.isReady, tint: Color.green)
+            Button { mapLayer = 2 } label: {
+                Label("卫星图", systemImage: mapLayer == 2 ? "checkmark" : "globe")
             }
+            Text("界面深浅与地图配色在「设置」里，默认自动")
+        } label: {
+            MapGlassButton(icon: mapLayer == 1 ? "car.fill" : (mapLayer == 2 ? "globe" : "map"),
+                           active: mapLayer != 0)
         }
     }
 
-    /// 地图外观：0 自动跟昼夜 / 1 标准 / 2 夜间 / 3 卫星
+    /// 地图配色：0 自动（日出日落）/ 1 标准 / 2 夜间
     private var mapNight: Bool {
         switch mapAppearance {
         case 1: return false
         case 2: return true
-        case 3: return false
         default: return settings.paletteNight
         }
     }
-    private var mapSatellite: Bool { mapAppearance == 3 }
+    private var mapSatellite: Bool { mapLayer == 2 }
+    private var mapTraffic: Bool { mapLayer == 1 }
 
     /// 右下角：回到我的定位位置（苹果地图式玻璃圆钮）
     private var recenterButton: some View {
@@ -944,24 +1015,25 @@ struct ContentView: View {
     /// 面板高度跟着阶段走；键盘弹起时收窄，保证搜索框始终看得见
     private func panelHeight(_ geo: GeometryProxy) -> CGFloat {
         let raw: CGFloat
-        if sheetExpanded { raw = min(geo.size.height * 0.82, 640) }
-        else if viaManager { raw = min(geo.size.height * 0.64, 480) }
-        else if addingVia { raw = min(geo.size.height * 0.52, 400) }
+        if sheetExpanded { raw = min(geo.size.height * 0.55, 430) }
+        else if viaManager { raw = min(geo.size.height * 0.58, 440) }
+        else if addingVia { raw = min(geo.size.height * 0.50, 380) }
         else if homeStage == .place { raw = 200 }
         else if homeStage == .routes { raw = min(geo.size.height * 0.52, 400) }
-        else { raw = hasSearchContent ? min(geo.size.height * 0.52, 400) : 122 }
+        else { raw = hasSearchContent ? min(geo.size.height * 0.50, 380) : 122 }
         let avail = geo.size.height - keyboardHeight - 20
         return min(raw, max(122, avail))
     }
 
-    /// 抽屉：抓手 + 搜索框固定；上滑展开最近去过 / 常用目的地 / 快捷功能
+    /// 抽屉：抓手 + 搜索框固定；上滑展开最近去过 / 常用目的地 / 快捷功能。
+    /// 背景延伸到屏幕最底部（忽略底部安全区），内容留 34pt 避开 home indicator。
     private func homeDrawer(height: CGFloat) -> some View {
         let showList = sheetExpanded || viaManager || addingVia || homeStage != .idle || hasSearchContent
         return VStack(spacing: 0) {
             if !showList { Spacer(minLength: 0) }
 
             VStack(spacing: 0) {
-                Capsule().fill(Color.white.opacity(0.32)).frame(width: 42, height: 5)
+                Capsule().fill(ContentView.ink.opacity(0.28)).frame(width: 42, height: 5)
                     .frame(maxWidth: .infinity, minHeight: 20)
                     .contentShape(Rectangle())
                     .onTapGesture { toggleSheet() }
@@ -1005,15 +1077,21 @@ struct ContentView: View {
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
-                Color.clear.frame(height: 30)     // 底部留白，避开 home indicator
+                Color.clear.frame(height: 34)     // 底部留白，避开 home indicator
                     .contentShape(Rectangle())
                     .onTapGesture { hideKeyboard() }
             }
         }
         .frame(height: height)
         .frame(maxWidth: .infinity)
-        .background(RoundedRectangle(cornerRadius: 22, style: .continuous).fill(Self.card.opacity(0.97)))
-        .overlay(RoundedRectangle(cornerRadius: 22, style: .continuous).stroke(Self.stroke, lineWidth: 1))
+        .background(
+            ZStack {
+                RoundedRectangle(cornerRadius: 22, style: .continuous).fill(.ultraThinMaterial)
+                RoundedRectangle(cornerRadius: 22, style: .continuous)
+                    .fill(Settings.shared.uiLight ? Color.white.opacity(0.55) : ContentView.card.opacity(0.94))
+            }
+        )
+        .overlay(RoundedRectangle(cornerRadius: 22, style: .continuous).stroke(ContentView.stroke, lineWidth: 1))
         .animation(.spring(response: 0.34, dampingFraction: 0.86), value: homeStage)
         .animation(.spring(response: 0.34, dampingFraction: 0.86), value: sheetExpanded)
         .animation(.spring(response: 0.34, dampingFraction: 0.86), value: hasSearchContent)
@@ -1030,6 +1108,45 @@ struct ContentView: View {
         withAnimation(.spring(response: 0.34, dampingFraction: 0.86)) { sheetExpanded.toggle() }
     }
 
+    /// 点按地图上的 POI：落针 + 地图定位 + 底部地点卡（苹果地图式）；逆地理编码补地址
+    private func selectMapPoi(name: String, coord: CLLocationCoordinate2D) {
+        guard !navi.navigating, !WebMotorSession.shared.running else { return }
+        hideKeyboard()
+        searchWork?.cancel()
+        search.clear()
+        let place = SearchService.Place(name: name, address: "地图上的地点",
+                                        lat: coord.latitude, lng: coord.longitude)
+        dest = place
+        setQuery(name)
+        shareStatus = ""
+        History.shared.add(place)
+        homeFocus = coord
+        focusToken += 1
+        sheetExpanded = false
+        poiSelected = true
+        homeStage = .place
+        navi.clearPlan()
+        SearchService.shared.reverseGeocode(lat: coord.latitude, lng: coord.longitude) { addr in
+            DispatchQueue.main.async {
+                guard !addr.isEmpty, dest?.name == name else { return }
+                dest = SearchService.Place(name: name, address: addr,
+                                           lat: coord.latitude, lng: coord.longitude)
+            }
+        }
+    }
+
+    /// 圆屏重刷固件后蓝牙地址可能变了：清掉缓存的 peripheral UUID，强制重新扫描
+    private func rescanRoundScreen() {
+        bleHint = "已清除旧圆屏记录，正在重新搜索…"
+        let b = BleLink.shared
+        b.disconnect()
+        UserDefaults.standard.removeObject(forKey: "ble_peripheral")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
+            UserDefaults.standard.removeObject(forKey: "ble_peripheral")
+            BleLink.shared.connect()
+        }
+    }
+
     /// 快捷功能：苹果地图式横向胶囊，点一下直接进功能，不用翻设置
     private var quickActions: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -1043,7 +1160,7 @@ struct ContentView: View {
                     quickChip("摩托车路线", "flag.fill", false) { openWebMotor(.motorcycle) }
                     quickChip("自行车路线", "bicycle", false) { openWebMotor(.bicycle) }
                     quickChip("骑行轨迹", "map", false) { showRides = true }
-                    quickChip("车牌与限行", "car.fill", settings.restrictionActive) { showPlate = true }
+                    quickChip("车辆与限行", "car.fill", settings.restrictionActive) { showPlate = true }
                     quickChip("全部设置", "gearshape", false) { showSettings = true }
                 }
             }
@@ -1072,9 +1189,24 @@ struct ContentView: View {
     private var settingsHub: some View {
         NavigationView {
             List {
+                Section(header: Text("地图与外观"), footer: Text(settings.uiAppearanceNote)) {
+                    Picker("界面外观", selection: $settings.uiAppearance) {
+                        Text("自动（日出日落）").tag(0)
+                        Text("浅色").tag(1)
+                        Text("深色").tag(2)
+                    }
+                    Picker("地图配色", selection: Binding(get: { min(mapAppearance, 2) },
+                                                         set: { mapAppearance = $0 })) {
+                        Text("自动（日出日落）").tag(0)
+                        Text("标准").tag(1)
+                        Text("夜间").tag(2)
+                    }
+                    Text("「驾车」地图会在底图上叠加实时拥堵路况；在右上角地图按钮里切换。")
+                        .font(.caption).foregroundColor(ContentView.sub)
+                }
                 Section(header: Text("导航与路线")) {
                     Button { hubPlate = true } label: {
-                        settingsRow("车牌与限行", settings.plateSummary, "car.fill", ContentView.cyan)
+                        settingsRow("车辆与限行", settings.plateSummary, "car.fill", ContentView.cyan)
                     }
                     Button { hubKeys = true } label: {
                         settingsRow("地图 Key", Settings.mask(settings.amapKeyInUse), "key.fill", ContentView.cyan)
@@ -1104,6 +1236,10 @@ struct ContentView: View {
                     NavigationLink(destination: AnyView(settingsDetail(.display))) {
                         settingsRow("圆屏显示", Settings.themeName(settings.theme), "circle.dashed", ContentView.pink)
                     }
+                    Button { rescanRoundScreen() } label: {
+                        settingsRow("重新搜索圆屏", bleHint.isEmpty ? "清除旧设备记录后重新扫描" : bleHint,
+                                    "arrow.triangle.2.circlepath", ContentView.cyan)
+                    }
                     NavigationLink(destination: AnyView(settingsDetail(.debug))) {
                         settingsRow("调试信息", "连接与导航日志", "doc.text", ContentView.sub)
                     }
@@ -1119,11 +1255,10 @@ struct ContentView: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .navigationBarTrailing) {
-                    Button("完成") { showSettings = false }.foregroundColor(ContentView.pink)
+                    Button("完成") { showSettings = false }.foregroundColor(ContentView.cyan)
                 }
             }
         }
-        .preferredColorScheme(.dark)
         .sheet(isPresented: $hubPlate) { PlateSetupView() }
         .sheet(isPresented: $hubKeys) { KeySetupView() }
         .sheet(isPresented: $hubRides) { NavigationView { RideHistoryView() } }
@@ -1136,7 +1271,7 @@ struct ContentView: View {
                 .frame(width: 28, height: 28)
                 .background(RoundedRectangle(cornerRadius: 7).fill(tint))
             VStack(alignment: .leading, spacing: 2) {
-                Text(title).font(.subheadline).foregroundColor(.white)
+                Text(title).font(.subheadline).foregroundColor(ContentView.ink)
                 if !sub.isEmpty { Text(sub).font(.caption2).foregroundColor(ContentView.sub).lineLimit(1) }
             }
             Spacer(minLength: 4)
@@ -1181,7 +1316,7 @@ struct ContentView: View {
 
     private var independentRouteCard: some View {
         CardView {
-            Text("独立路线规划").foregroundColor(.white).bold()
+            Text("独立路线规划").foregroundColor(ContentView.ink).bold()
             Text("摩托车 / 自行车用网页版算路，不走高德驾车导航，也不受车牌限行设置影响。")
                 .font(.caption).foregroundColor(ContentView.sub)
             Button { openHubWebMotor(.motorcycle) } label: {
@@ -1214,7 +1349,7 @@ struct ContentView: View {
     private var cruiseCard: some View {
         CardView {
             HStack {
-                Text("巡航模式").foregroundColor(.white).bold()
+                Text("巡航模式").foregroundColor(ContentView.ink).bold()
                 Spacer()
                 if navi.cruising { Text("进行中 · \(navi.uiSpeed) km/h").font(.caption).foregroundColor(ContentView.cyan) }
             }
@@ -1234,12 +1369,12 @@ struct ContentView: View {
     // MARK: 圆屏设置
     private var settingsCard: some View {
         CardView {
-            Text("圆屏设置").foregroundColor(.white).bold()
+            Text("圆屏设置").foregroundColor(ContentView.ink).bold()
             Picker("开机动画", selection: $settings.bootBrand) {
                 ForEach(Settings.bootBrands.indices, id: \.self) { i in Text(Settings.bootBrands[i]).tag(i) }
             }.tint(ContentView.cyan)
             Text(settings.bootStatus).font(.caption).foregroundColor(ContentView.sub)
-            Toggle("蓝牙媒体按键（QQ 音乐等）", isOn: $settings.musicHID).foregroundColor(.white).tint(ContentView.pink)
+            Toggle("蓝牙媒体按键（QQ 音乐等）", isOn: $settings.musicHID).foregroundColor(ContentView.ink).tint(ContentView.pink)
             if settings.musicHID {
                 Text(ble.mediaHIDSupported
                      ? (ble.mediaHIDReady && ble.mediaHIDMode ? "媒体按键已就绪" : ble.mediaAMSControls > 0 && ble.mediaHIDMode ? "AMS 媒体控制已就绪，HID 当前不可用" : "请在 iPhone 设置 → 蓝牙中配对 MotoNav；按圆屏配对码提示完成")
@@ -1248,7 +1383,7 @@ struct ContentView: View {
                 if !ble.mediaSongInfo.isEmpty {
                     Text(ble.mediaSongInfo).font(.caption).foregroundColor(ContentView.cyan)
                 }
-                Toggle("显示逐句歌词", isOn: $settings.musicLyrics).foregroundColor(.white).tint(ContentView.pink)
+                Toggle("显示逐句歌词", isOn: $settings.musicLyrics).foregroundColor(ContentView.ink).tint(ContentView.pink)
                 Text("默认关闭，上方歌名、下方歌手。开启后按歌曲信息从 LRCLIB 匹配歌词，歌词显示在歌手下方；未匹配到时保留歌名和歌手。")
                     .font(.caption).foregroundColor(ContentView.sub)
                 if !settings.musicLyrics && ble.mediaLyricsActive { Text("正在关闭圆屏歌词…").font(.caption).foregroundColor(ContentView.sub) }
@@ -1264,40 +1399,40 @@ struct ContentView: View {
             }
             Text("关闭蓝牙媒体按键后，改用系统音乐 App 控制。不读取来电号码。巡航连续停车 10 分钟自动结束。")
                 .font(.caption).foregroundColor(ContentView.sub)
-            Text("圆屏方向").foregroundColor(.white).padding(.top, 6)
+            Text("圆屏方向").foregroundColor(ContentView.ink).padding(.top, 6)
             RotationDial(degrees: $settings.rotationDeg)      // iOS v0.5.1 按住圆盘转动调角度
             Text("按住圆盘转动（顺时针为正），粉色指针是画面上方在圆屏上朝的方向，圆屏会跟着实时转。转到 0°/90°/180°/270° 附近会吸住。任意角度要圆屏固件 v7.10.1；旧固件会转到最接近的 90°")
                 .font(.caption2).foregroundColor(ContentView.sub)
             // iOS v0.6 屏幕刷新速度、快速刷屏（圆屏存起来并自动重启；当前值来自圆屏的帧率回报）
-            Text("刷新速度").foregroundColor(.white).padding(.top, 6)
+            Text("刷新速度").foregroundColor(ContentView.ink).padding(.top, 6)
             Picker("刷新速度", selection: Binding(get: { ble.screenMHz }, set: { ble.setScreenMHz($0) })) {
                 Text("40 标准").tag(40); Text("60").tag(60); Text("80").tag(80)
             }
             .pickerStyle(.segmented)
             .disabled(!ble.isReady)
             Toggle("快速刷屏", isOn: Binding(get: { ble.screenFast == 1 }, set: { ble.setScreenFast($0) }))
-                .foregroundColor(.white).tint(ContentView.pink)
+                .foregroundColor(ContentView.ink).tint(ContentView.pink)
                 .disabled(!ble.isReady)
             Text(ble.screenMHz < 0
                  ? "越快画面撕裂越轻；花屏就切回 40、关掉快速刷屏。切换后圆屏会自动重启。现在的值要等圆屏显示过小地图才知道"
                  : "越快画面撕裂越轻；花屏就切回 40、关掉快速刷屏。切换后圆屏会自动重启")
                 .font(.caption2).foregroundColor(ContentView.sub)
-            Toggle("亮度跟着昼夜自动调", isOn: $settings.brightAuto).foregroundColor(.white).tint(ContentView.pink)
+            Toggle("亮度跟着昼夜自动调", isOn: $settings.brightAuto).foregroundColor(ContentView.ink).tint(ContentView.pink)
             if settings.brightAuto {
                 HStack {
-                    Text("白天").foregroundColor(.white)
+                    Text("白天").foregroundColor(ContentView.ink)
                     Slider(value: $settings.brightDay, in: 5...255, step: 5).tint(ContentView.pink)
                     Text("\(Int(settings.brightDay))").font(.caption).foregroundColor(ContentView.sub).frame(width: 34)
                 }
                 HStack {
-                    Text("夜间").foregroundColor(.white)
+                    Text("夜间").foregroundColor(ContentView.ink)
                     Slider(value: $settings.brightNight, in: 5...255, step: 5).tint(ContentView.pink)
                     Text("\(Int(settings.brightNight))").font(.caption).foregroundColor(ContentView.sub).frame(width: 34)
                 }
                 if !settings.brightDesc.isEmpty { Text(settings.brightDesc).font(.caption2).foregroundColor(ContentView.sub) }
             } else {
                 HStack {
-                    Text("亮度").foregroundColor(.white)
+                    Text("亮度").foregroundColor(ContentView.ink)
                     Slider(value: $settings.brightness, in: 5...255, step: 5).tint(ContentView.pink)
                     Text("\(Int(settings.brightness))").font(.caption).foregroundColor(ContentView.sub).frame(width: 34)
                 }
@@ -1307,14 +1442,14 @@ struct ContentView: View {
 
     private var displayCard: some View {
         CardView {
-            Text("圆屏显示").foregroundColor(.white).bold()
-            Toggle("路程进度环", isOn: $settings.progressRing).foregroundColor(.white).tint(Self.pink)
+            Text("圆屏显示").foregroundColor(ContentView.ink).bold()
+            Toggle("路程进度环", isOn: $settings.progressRing).foregroundColor(ContentView.ink).tint(Self.pink)
             Picker("预判", selection: $settings.leadMs) {
                 Text("关闭").tag(0); Text("0.3秒").tag(300); Text("0.6秒").tag(600)
             }.pickerStyle(.segmented)
             Text("地图状态：\(map.shortStatus)").font(.caption).foregroundColor(Self.sub)
             HStack {
-                Text("风格").foregroundColor(.white)
+                Text("风格").foregroundColor(ContentView.ink)
                 Spacer()
                 Picker("风格", selection: $settings.theme) {
                     ForEach(Settings.themeOrder, id: \.self) { t in Text(Settings.themeName(t)).tag(t) }
@@ -1322,11 +1457,11 @@ struct ContentView: View {
                 .tint(ContentView.cyan)
             }
             Text(Settings.themeDesc(settings.theme)).font(.caption2).foregroundColor(ContentView.sub)
-            Toggle("小地图", isOn: $settings.mapOn).foregroundColor(.white).tint(ContentView.pink)
+            Toggle("小地图", isOn: $settings.mapOn).foregroundColor(ContentView.ink).tint(ContentView.pink)
             if settings.mapOn {
                 Text("地图来源：高德（普通底图和卫星图）").font(.caption).foregroundColor(ContentView.sub)
                 if settings.mapSource == MapFeeder.SRC_AMAP && settings.theme == 1 {
-                    Toggle("俯视建筑轮廓", isOn: $settings.buildings).foregroundColor(.white).tint(ContentView.pink)
+                    Toggle("俯视建筑轮廓", isOn: $settings.buildings).foregroundColor(ContentView.ink).tint(ContentView.pink)
                     Text(ble.buildingsSupported ? "圆屏支持建筑图层，默认提取高德建筑俯视轮廓" : "正在查询圆屏建筑能力；确认前先显示普通底图")
                         .font(.caption2).foregroundColor(ContentView.sub)
                     if ble.isReady && !ble.buildingsSupported {
@@ -1337,26 +1472,26 @@ struct ContentView: View {
                 Text(map.offlineStatus).font(.caption).foregroundColor(ContentView.sub)
                 Text("选定路线后，前台自动下载沿途地图；锁屏使用已保存地图包。请等下载完成再出发。")
                     .font(.caption2).foregroundColor(ContentView.sub)
-                Text("走过的路线").foregroundColor(.white)
+                Text("走过的路线").foregroundColor(ContentView.ink)
                 Picker("走过的路线", selection: $settings.trail) {
                     Text("变灰").tag(1); Text("擦除").tag(2)
                 }
                 .pickerStyle(.segmented)
-                Toggle("清爽模式", isOn: $settings.clean).foregroundColor(.white).tint(ContentView.pink)
+                Toggle("清爽模式", isOn: $settings.clean).foregroundColor(ContentView.ink).tint(ContentView.pink)
                 Text("清爽模式：地图保留，去掉红绿灯、电子眼、安全提示、测速牌和行程信息").font(.caption2).foregroundColor(ContentView.sub)
             }
-            Text("夜间配色").foregroundColor(.white)
+            Text("夜间配色").foregroundColor(ContentView.ink)
             Picker("夜间配色", selection: $settings.nightMode) {
                 Text("自动（日出日落）").tag(0); Text("白天").tag(1); Text("夜间").tag(2)
             }
             .pickerStyle(.segmented)
             if !settings.nightDesc.isEmpty { Text(settings.nightDesc).font(.caption2).foregroundColor(ContentView.sub) }
-            Toggle("弯道急缓上色", isOn: $settings.curve).foregroundColor(.white).tint(ContentView.pink)
+            Toggle("弯道急缓上色", isOn: $settings.curve).foregroundColor(ContentView.ink).tint(ContentView.pink)
         }
     }
     private var favoritesCard: some View {
         CardView {
-            Text("常用目的地").foregroundColor(.white).bold()
+            Text("常用目的地").foregroundColor(ContentView.ink).bold()
             if favorites.places.isEmpty { Text("选择目的地后点收藏").foregroundColor(Self.sub) }
             ForEach(favorites.places) { place in
                 HStack {
@@ -1369,7 +1504,7 @@ struct ContentView: View {
     }
     private var voiceCard: some View {
         CardView {
-            Text("导航语音").foregroundColor(.white).bold()
+            Text("导航语音").foregroundColor(ContentView.ink).bold()
             Toggle("导航静音", isOn: $settings.voiceMuted)
             Toggle("播报时压低音乐", isOn: $settings.duck)
             Picker("系统音色", selection: $voiceID) {
@@ -1381,13 +1516,13 @@ struct ContentView: View {
             Text("语速"); Slider(value: $voiceRate, in: 0.3...0.6)
             Text("音调"); Slider(value: $voicePitch, in: 0.7...1.4)
             Button("试听播报") { Speech.shared.test() }
-        }.foregroundColor(.white).tint(Self.pink)
+        }.foregroundColor(ContentView.ink).tint(Self.pink)
     }
 
     // MARK: Key 设置
     private var keyCard: some View {
         CardView {
-            Text("Key 设置").foregroundColor(.white).bold()
+            Text("Key 设置").foregroundColor(ContentView.ink).bold()
             Text("高德 Key：\(Settings.mask(settings.amapKeyInUse))（搜索、导航、巡航用）")
                 .font(.footnote).foregroundColor(settings.amapKeyInUse.isEmpty ? Color.orange : ContentView.sub)
             Text("和风天气：\(weather.host.isEmpty || weather.key.isEmpty ? "未配置（可选）" : "已配置")")
@@ -1445,29 +1580,37 @@ struct SheetBlock<Content: View>: View {
     }
 }
 
-/// 苹果地图式悬浮玻璃圆钮
+/// 苹果地图式悬浮玻璃圆钮：浅色模式白玻璃 + 蓝色图标，深色模式深玻璃 + 白图标
 struct MapGlassButton: View {
     let icon: String
     var active = false
     var tint: Color = ContentView.cyan
     var body: some View {
-        Image(systemName: icon)
+        let light = Settings.shared.uiLight
+        return Image(systemName: icon)
             .font(.system(size: 17, weight: .semibold))
-            .foregroundColor(.white)
+            .foregroundColor(active ? .white : (light ? ContentView.cyan : .white))
             .frame(width: 42, height: 42)
-            .background(Circle().fill(active ? tint.opacity(0.9) : ContentView.card.opacity(0.94)))
-            .overlay(Circle().stroke(Color.white.opacity(0.16), lineWidth: 1))
-            .shadow(color: Color.black.opacity(0.25), radius: 6, y: 3)
+            .background(Circle().fill(active ? tint.opacity(0.92)
+                                              : (light ? Color.white.opacity(0.86) : ContentView.card.opacity(0.94))))
+            .overlay(Circle().stroke(light ? Color.black.opacity(0.08) : Color.white.opacity(0.16), lineWidth: 1))
+            .shadow(color: Color.black.opacity(light ? 0.12 : 0.25), radius: 8, y: 3)
     }
 }
 
 struct CardView<Content: View>: View {
     @ViewBuilder var content: Content
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) { content }
+        let light = Settings.shared.uiLight
+        return VStack(alignment: .leading, spacing: 10) { content }
             .padding(16)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(RoundedRectangle(cornerRadius: 18).fill(ContentView.card))
+            .background(
+                ZStack {
+                    RoundedRectangle(cornerRadius: 18).fill(.ultraThinMaterial)
+                    RoundedRectangle(cornerRadius: 18).fill(light ? Color.white.opacity(0.62) : ContentView.card)
+                }
+            )
             .overlay(RoundedRectangle(cornerRadius: 18).stroke(ContentView.stroke, lineWidth: 1))
     }
 }
@@ -1477,15 +1620,16 @@ struct RouteCard: View {
     let option: NaviBridge.RouteOption
     let selected: Bool
     var body: some View {
-        VStack(alignment: .leading, spacing: 3) {
+        let light = Settings.shared.uiLight
+        return VStack(alignment: .leading, spacing: 3) {
             Text(option.label).font(.caption).foregroundColor(selected ? ContentView.pink : ContentView.sub).lineLimit(1)
-            Text(NaviBridge.durText(option.timeS)).font(.headline).foregroundColor(.white).lineLimit(1).minimumScaleFactor(0.7)
+            Text(NaviBridge.durText(option.timeS)).font(.headline).foregroundColor(ContentView.ink).lineLimit(1).minimumScaleFactor(0.7)
             Text(NaviBridge.distText(option.length) + (option.lights > 0 ? " · \(option.lights)灯" : "") + (option.toll > 0 ? " · ¥\(option.toll)" : ""))
                 .font(.caption2).foregroundColor(ContentView.sub).lineLimit(1).minimumScaleFactor(0.7)
         }
         .padding(10)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(RoundedRectangle(cornerRadius: 12).fill(ContentView.bg))
+        .background(RoundedRectangle(cornerRadius: 12).fill(light ? Color.white.opacity(0.7) : ContentView.bg))
         .overlay(RoundedRectangle(cornerRadius: 12).stroke(selected ? ContentView.pink : ContentView.stroke, lineWidth: selected ? 2 : 1))
         .contentShape(Rectangle())
     }
@@ -1537,16 +1681,21 @@ private enum SettingsPage: String, CaseIterable, Identifiable {
 struct HomeMapView: UIViewRepresentable {
     let night: Bool
     var satellite = false
+    var traffic = false
     var focus: CLLocationCoordinate2D? = nil
     var focusToken = 0
     var recenterToken = 0
     var overviewToken = 0
+    var northToken = 0
     var routes: [NaviBridge.RouteOption] = []
     var selectedRouteID = -1
     var ghost: [CLLocationCoordinate2D] = []
     var dest: CLLocationCoordinate2D? = nil
     var vias: [CLLocationCoordinate2D] = []
     var bottomInset: CGFloat = 122
+    var onRotation: ((Bool) -> Void)? = nil
+    var onPoiTap: ((String, CLLocationCoordinate2D) -> Void)? = nil
+    var onBlankTap: (() -> Void)? = nil
 
     /// 坐标指纹：把字符串插值从长链式表达式里拆出来
     private static func coordKey(_ c: CLLocationCoordinate2D?) -> String {
@@ -1564,6 +1713,8 @@ struct HomeMapView: UIViewRepresentable {
     func makeUIView(context: Context) -> MAMapView {
         let map = MAMapView(frame: .zero)
         map.mapType = HomeMapView.mapType(night: night, satellite: satellite)
+        map.showTraffic = traffic                 // 驾车图：实时拥堵路况
+        map.touchPOIEnabled = true                // 点按地图上的地点 → 底部地点卡
         map.showsCompass = false
         map.showsScale = false
         map.showsUserLocation = true
@@ -1573,13 +1724,28 @@ struct HomeMapView: UIViewRepresentable {
         map.zoomLevel = 16
         map.userTrackingMode = .follow
         map.delegate = context.coordinator.asDelegate
+        let c = context.coordinator
+        c.onRotation = onRotation
+        c.onPoiTap = onPoiTap
+        c.onBlankTap = onBlankTap
+        c.watchRotation(map)
         return map
     }
 
     func updateUIView(_ map: MAMapView, context: Context) {
         let type: MAMapType = HomeMapView.mapType(night: night, satellite: satellite)
         if map.mapType != type { map.mapType = type }
+        if map.showTraffic != traffic { map.showTraffic = traffic }
         let c = context.coordinator
+        c.onRotation = onRotation
+        c.onPoiTap = onPoiTap
+        c.onBlankTap = onBlankTap
+        c.watchRotation(map)
+
+        if c.northSeq != northToken {
+            c.northSeq = northToken
+            map.setRotationDegree(0, animated: true, duration: 0.3)
+        }
 
         // 内容没变就不重画，避免 SwiftUI 频繁刷新把地图拖卡。
         // 拆成带显式类型的小表达式：整段长链式插值会让 Swift 类型检查器超时（Xcode 16.4 实测）。
@@ -1643,28 +1809,110 @@ struct HomeMapView: UIViewRepresentable {
     }
 }
 
-/// 地图回调：选中路线粉色粗线、备选灰色、分享原路线橙色虚线；目的地红针、途经点紫针。
+/// 地图回调：选中路线主色粗线、备选灰色、分享原路线橙色虚线；目的地红针、途经点紫针。
+/// 当前位置用苹果式蓝色圆点（白边 + 浅蓝精度圈），不再用高德默认的大头针。
 /// 与工程里的 RouteMapDelegate 同样用运行时登记协议，避开 Swift / 高德 SDK 方法名冲突。
 final class HomeMapDelegate: NSObject {
     var key = ""
     var focusSeq = -1
     var recenterSeq = -1
     var overviewSeq = -1
+    var northSeq = -1
+    var onRotation: ((Bool) -> Void)?
+    var onPoiTap: ((String, CLLocationCoordinate2D) -> Void)?
+    var onBlankTap: (() -> Void)?
+    private var rotationTimer: Timer?
+    private var rotated = false
+    private var lastPoiAt = Date.distantPast
 
     var asDelegate: MAMapViewDelegate? {
         class_addProtocol(HomeMapDelegate.self, MAMapViewDelegate.self)
         return (self as AnyObject) as? MAMapViewDelegate
     }
 
+    /// 轮询 rotationDegree：不依赖 SDK 的旋转回调选择器，手动旋转后立刻通知 SwiftUI 显示回正按钮
+    func watchRotation(_ map: MAMapView) {
+        guard rotationTimer == nil else { return }
+        let t = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self, weak map] _ in
+            guard let s = self, let m = map else { return }
+            let d = abs(m.rotationDegree.truncatingRemainder(dividingBy: 360))
+            let now = d > 1.0 && d < 359.0
+            if now != s.rotated {
+                s.rotated = now
+                DispatchQueue.main.async { s.onRotation?(now) }
+            }
+        }
+        RunLoop.main.add(t, forMode: .common)
+        rotationTimer = t
+    }
+
+    deinit { rotationTimer?.invalidate() }
+
+    /// 苹果地图式定位点：浅蓝精度圈 + 白边蓝色实心圆点 + 轻微投影
+    private static func userDot(_ m: MAMapView, _ a: MAAnnotation) -> MAAnnotationView {
+        let id = "appleUserDot"
+        let v = m.dequeueReusableAnnotationView(withIdentifier: id)
+            ?? MAAnnotationView(annotation: a, reuseIdentifier: id)
+        v.annotation = a
+        v.frame = CGRect(x: 0, y: 0, width: 26, height: 26)
+        v.backgroundColor = UIColor.clear
+        v.centerOffset = CGPoint(x: 0, y: 0)
+        if v.viewWithTag(8801) == nil {
+            let ring = UIView(frame: CGRect(x: 0, y: 0, width: 26, height: 26))
+            ring.backgroundColor = UIColor.systemBlue.withAlphaComponent(0.14)
+            ring.layer.cornerRadius = 13
+            ring.tag = 8801
+            v.addSubview(ring)
+            let dot = UIView(frame: CGRect(x: 5, y: 5, width: 16, height: 16))
+            dot.backgroundColor = UIColor.systemBlue
+            dot.layer.cornerRadius = 8
+            dot.layer.borderColor = UIColor.white.cgColor
+            dot.layer.borderWidth = 3
+            dot.layer.shadowColor = UIColor.black.cgColor
+            dot.layer.shadowOpacity = 0.28
+            dot.layer.shadowRadius = 3
+            dot.layer.shadowOffset = CGSize(width: 0, height: 1)
+            dot.tag = 8802
+            v.addSubview(dot)
+        }
+        return v
+    }
+
     @objc(mapView:viewForAnnotation:)
     func annotationView(_ m: MAMapView, annotation: MAAnnotation) -> MAAnnotationView? {
+        if annotation is MAUserLocation {
+            return HomeMapDelegate.userDot(m, annotation)
+        }
         guard let a = annotation as? MAPointAnnotation else { return nil }
         let id = "homePin"
-        let v = (m.dequeueReusableAnnotationView(withIdentifier: id) as? MAPinAnnotationView) ?? MAPinAnnotationView(annotation: a, reuseIdentifier: id)
+        let v = (m.dequeueReusableAnnotationView(withIdentifier: id) as? MAPinAnnotationView)
+            ?? MAPinAnnotationView(annotation: a, reuseIdentifier: id)
         v?.annotation = a
         v?.pinColor = a.title == "目的地" ? .red : .purple
         v?.canShowCallout = false
         return v
+    }
+
+    /// 点按地图上的 POI（touchPOIEnabled = YES）
+    @objc(mapView:didTouchPois:)
+    func didTouchPois(_ m: MAMapView, pois: NSArray) {
+        guard let p = pois.firstObject as? MATouchPoi else { return }
+        let name: String = (p.name as? String) ?? ""
+        guard !name.isEmpty else { return }
+        let coord: CLLocationCoordinate2D = p.coordinate
+        lastPoiAt = Date()
+        DispatchQueue.main.async { [weak self] in
+            self?.onPoiTap?(name, coord)
+        }
+    }
+
+    /// 点空白处收起地点卡；延迟 0.3s 是为了让 didTouchPois 先处理，避免误收
+    @objc(mapView:didSingleTappedAtCoordinate:)
+    func didSingleTap(_ m: MAMapView, coordinate: CLLocationCoordinate2D) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.30) { [weak self] in
+            guard let s = self, Date().timeIntervalSince(s.lastPoiAt) > 0.28 else { return }
+            s.onBlankTap?()
+        }
     }
 
     @objc(mapView:rendererForOverlay:)
@@ -1672,129 +1920,194 @@ final class HomeMapDelegate: NSObject {
         guard let pl = overlay as? MAPolyline, let r = MAPolylineRenderer(polyline: pl) else { return nil }
         r.lineJoinType = kMALineJoinRound
         r.lineCapType = kMALineCapRound
+        let light = Settings.shared.uiLight
         switch pl.title {
         case "sel":
-            r.strokeColor = UIColor(red: 1, green: 0.31, blue: 0.71, alpha: 1); r.lineWidth = 8
+            r.strokeColor = light ? UIColor.systemBlue : UIColor(red: 1, green: 0.31, blue: 0.71, alpha: 1)
+            r.lineWidth = 8
         case "ghost":
             r.strokeColor = UIColor(red: 1, green: 0.62, blue: 0.15, alpha: 0.95); r.lineWidth = 4
             r.lineDashType = kMALineDashTypeSquare
         default:
-            r.strokeColor = UIColor(white: 0.6, alpha: 0.7); r.lineWidth = 6
+            r.strokeColor = UIColor(white: light ? 0.55 : 0.6, alpha: 0.7); r.lineWidth = 6
         }
         return r
     }
 }
 
-// MARK: - 车牌与限行设置
+// MARK: - 车辆与限行（苹果地图式「我的车辆」）
 
-/// 填一次车牌，之后每次点「路线」都会把车牌交给高德，自动规避当日限行。
-/// 高德接口：AMapNaviVehicleInfo.vehicleId + isETARestriction + type → AMapNaviDriveManager.setVehicleInfo()
+/// 可保存多台车辆、选一台用于限行判断；限行状态来自高德本次算路返回的 restrictionInfo。
 struct PlateSetupView: View {
     @ObservedObject private var settings = Settings.shared
+    @ObservedObject private var navi = NaviBridge.shared
     @Environment(\.presentationMode) private var presentationMode
-    @State private var draft = ""
-    @State private var vehicleType = 0
-    @State private var avoid = true
+    @State private var showEditor = false
+    @State private var editing: Settings.Vehicle? = nil
+
+    var body: some View {
+        NavigationView {
+            List {
+                Section(header: Text("我的车辆")) {
+                    ForEach(settings.savedVehicles) { v in vehicleRow(v) }
+                    Button {
+                        editing = nil
+                        showEditor = true
+                    } label: {
+                        Label("添加车辆", systemImage: "plus.circle.fill")
+                            .foregroundColor(ContentView.cyan)
+                    }
+                }
+                Section(header: Text("限行"), footer: Text(limitationNote)) {
+                    Toggle("规划路线时避开限行", isOn: $settings.avoidRestriction)
+                        .tint(ContentView.pink)
+                        .onChange(of: settings.avoidRestriction) { _ in settings.applyVehicleSettings() }
+                    Text("选中的车辆会用于每一次驾车路线规划；切换车辆会立刻重算已有路线。")
+                        .font(.caption).foregroundColor(ContentView.sub)
+                }
+                Section(header: Text("本次算路的限行结果")) {
+                    HStack(alignment: .top, spacing: 10) {
+                        Image(systemName: navi.restrictionOK ? "checkmark.shield.fill" : "exclamationmark.shield.fill")
+                            .foregroundColor(navi.restrictionOK ? .green : .orange)
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(navi.restrictionSummary).font(.subheadline).foregroundColor(ContentView.ink)
+                            Text("这里显示高德导航 SDK 本次算路返回的限行结论，不再是未经证实的「已避开限行」。")
+                                .font(.caption2).foregroundColor(ContentView.sub)
+                        }
+                    }
+                    Text(navi.vehicleInfoAccepted ? "高德已接受当前车牌" : "高德尚未接受当前车牌（检查车牌格式 / Key / 权限）")
+                        .font(.caption2).foregroundColor(navi.vehicleInfoAccepted ? .green : .orange)
+                    Text("SDK 限行代码：\(navi.restrictionType)")
+                        .font(.caption2).foregroundColor(ContentView.sub)
+                    Button { settings.applyVehicleSettings() } label: {
+                        Label("重新提交车牌并重新规划", systemImage: "arrow.clockwise")
+                            .font(.caption).foregroundColor(ContentView.cyan)
+                    }
+                }
+            }
+            .listStyle(.insetGrouped)
+            .navigationTitle("车辆与限行")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("完成") { presentationMode.wrappedValue.dismiss() }
+                        .foregroundColor(ContentView.cyan)
+                }
+            }
+            .sheet(isPresented: $showEditor) {
+                VehicleEditorView(vehicle: editing) { saved in
+                    settings.upsertVehicle(saved)
+                    settings.selectVehicle(saved)
+                }
+            }
+        }
+    }
+
+    private func vehicleRow(_ v: Settings.Vehicle) -> some View {
+        Button { settings.selectVehicle(v) } label: {
+            HStack(spacing: 12) {
+                Image(systemName: "car.fill").font(.subheadline).foregroundColor(.white)
+                    .frame(width: 30, height: 30)
+                    .background(RoundedRectangle(cornerRadius: 8).fill(ContentView.cyan))
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(v.name.isEmpty ? v.plate : v.name).font(.subheadline).foregroundColor(ContentView.ink)
+                    Text(Settings.vehicleTypeName(v.type) + " · " + v.plate)
+                        .font(.caption).foregroundColor(ContentView.sub)
+                }
+                Spacer(minLength: 4)
+                if v.id == settings.activeVehicleID {
+                    Image(systemName: "checkmark").foregroundColor(ContentView.cyan)
+                }
+            }
+            .padding(.vertical, 3)
+        }
+        .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+            Button(role: .destructive) { settings.removeVehicle(id: v.id) } label: {
+                Label("删除", systemImage: "trash")
+            }
+            Button { editing = v; showEditor = true } label: {
+                Label("编辑", systemImage: "pencil")
+            }.tint(ContentView.cyan)
+        }
+    }
+
+    private var limitationNote: String {
+        "高德 iOS 导航 SDK 通过 AMapNaviVehicleInfo.vehicleId + isETARestriction 规避小客车限行。" +
+        "若起点 / 终点本身在限行区域内，或当地没有适用于该车牌的限行规则，路线不会变化；禁摩规则不在覆盖范围。" +
+        "限行结论以路线面板显示的 SDK 返回值为准。"
+    }
+}
+
+/// 添加 / 编辑车辆：车牌 + 省份快捷键 + 车型 + 备注
+struct VehicleEditorView: View {
+    let vehicle: Settings.Vehicle?
+    let onSave: (Settings.Vehicle) -> Void
+    @Environment(\.presentationMode) private var presentationMode
+    @State private var name = ""
+    @State private var plate = ""
+    @State private var type = 0
     @State private var note = ""
 
     var body: some View {
         NavigationView {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 14) {
-                    CardView {
-                        Text("车牌号").foregroundColor(.white).bold()
-                        TextField("例如 京A12345 / 京AD12345", text: $draft)
-                            .textFieldStyle(.plain)
-                            .font(.title3.monospaced())
-                            .foregroundColor(.white)
-                            .padding(12)
-                            .background(RoundedRectangle(cornerRadius: 10).fill(ContentView.bg))
-                            .overlay(RoundedRectangle(cornerRadius: 10).stroke(ContentView.stroke, lineWidth: 1))
-                        Text("普通车牌 7 位、新能源车牌 8 位；会自动去掉空格和标点、把字母转成大写。")
-                            .font(.caption).foregroundColor(ContentView.sub)
-                        Text("点一下选省份，后面直接填字母和数字").font(.caption2).foregroundColor(ContentView.sub)
-                        provinceChips
-                    }
-
-                    CardView {
-                        Text("车辆类型").foregroundColor(.white).bold()
-                        HStack(spacing: 8) {
-                            ForEach(Settings.vehicleTypes) { v in
-                                Button { vehicleType = v.code } label: {
-                                    Text(v.name).font(.caption)
-                                        .foregroundColor(vehicleType == v.code ? .white : ContentView.sub)
-                                        .frame(maxWidth: .infinity, minHeight: 36)
-                                        .background(Capsule().fill(vehicleType == v.code ? ContentView.pink : ContentView.bg))
-                                }
-                                .buttonStyle(.plain)
-                            }
-                        }
-                        Text("新能源车牌请选「纯电客车」或「插混客车」，否则尾号限行可能判断不准。")
-                            .font(.caption).foregroundColor(ContentView.sub)
-                    }
-
-                    CardView {
-                        Toggle("规划路线时避开限行", isOn: $avoid)
-                            .font(.subheadline).foregroundColor(.white).tint(ContentView.pink)
-                        Text("开启后，每次规划路线都会把车牌传给高德，绕开当日尾号限行、外地牌限行等路段；改完已有路线会立刻重算。")
-                            .font(.caption).foregroundColor(ContentView.sub)
-                        Text("限行数据以高德为准。各地禁摩规则与汽车尾号限行不同，本功能按小客车规则处理，请以现场交通标志为准。")
-                            .font(.caption2).foregroundColor(ContentView.sub)
-                    }
-
-                    if !note.isEmpty { Text(note).font(.caption).foregroundColor(.orange) }
-
-                    if !settings.plateNumber.isEmpty {
-                        Button {
-                            settings.plateNumber = ""
-                            settings.applyVehicleSettings()
-                            presentationMode.wrappedValue.dismiss()
-                        } label: {
-                            Text("清除车牌").font(.subheadline).foregroundColor(.orange)
+            Form {
+                Section(header: Text("车牌")) {
+                    TextField("例如 京A12345 / 京AD12345", text: $plate)
+                        .font(.title3.monospaced())
+                        .disableAutocorrection(true)
+                    Text("点一下选省份简称，再填后面的字母和数字。")
+                        .font(.caption).foregroundColor(ContentView.sub)
+                    provinceChips
+                }
+                Section(header: Text("车辆")) {
+                    TextField("备注（例如：家里的车）", text: $name)
+                    Picker("车辆类型", selection: $type) {
+                        ForEach(Settings.vehicleTypes) { t in
+                            Text(t.name).tag(t.code)
                         }
                     }
                 }
-                .padding(16)
+                if !note.isEmpty {
+                    Section { Text(note).font(.caption).foregroundColor(.orange) }
+                }
             }
-            .background(ContentView.bg.ignoresSafeArea())
-            .navigationTitle("车牌与限行")
+            .navigationTitle(vehicle == nil ? "添加车辆" : "编辑车辆")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .navigationBarLeading) {
                     Button("取消") { presentationMode.wrappedValue.dismiss() }
-                        .foregroundColor(ContentView.sub)
                 }
                 ToolbarItem(placement: .navigationBarTrailing) {
-                    Button("保存") { save() }.foregroundColor(ContentView.pink)
+                    Button("保存") { save() }
                 }
             }
-        }
-        .onAppear {
-            draft = settings.plateNumber
-            vehicleType = settings.vehicleType
-            avoid = settings.avoidRestriction
+            .onAppear {
+                name = vehicle?.name ?? ""
+                plate = vehicle?.plate ?? ""
+                type = vehicle?.type ?? 0
+            }
         }
     }
 
     private var currentProvince: String {
-        guard let f = Settings.normalizedPlate(draft).first else { return "" }
+        guard let f = Settings.normalizedPlate(plate).first else { return "" }
         return String(f)
     }
 
-    /// 省份简称快捷按钮：点一下替换车牌首字，省得切中文键盘
     private var provinceChips: some View {
-        LazyVGrid(columns: [GridItem(.adaptive(minimum: 34), spacing: 6)], spacing: 6) {
+        LazyVGrid(columns: [GridItem(.adaptive(minimum: 36), spacing: 6)], spacing: 6) {
             ForEach(Settings.plateProvinces, id: \.self) { p in
                 Button {
-                    let body = Settings.normalizedPlate(draft)
-                    let tail = Settings.plateProvinces.contains(currentProvince) ? String(body.dropFirst()) : body
-                    draft = p + tail
+                    let body = Settings.normalizedPlate(plate)
+                    let tail = Settings.plateProvinces.contains(currentProvince)
+                        ? String(body.dropFirst()) : body
+                    plate = p + tail
                 } label: {
                     Text(p).font(.subheadline)
-                        .foregroundColor(currentProvince == p ? .white : ContentView.sub)
+                        .foregroundColor(currentProvince == p ? .white : ContentView.ink)
                         .frame(maxWidth: .infinity, minHeight: 30)
                         .background(RoundedRectangle(cornerRadius: 7)
-                            .fill(currentProvince == p ? ContentView.pink : ContentView.bg))
+                            .fill(currentProvince == p ? ContentView.pink : ContentView.stroke.opacity(0.45)))
                 }
                 .buttonStyle(.plain)
             }
@@ -1802,15 +2115,14 @@ struct PlateSetupView: View {
     }
 
     private func save() {
-        let p = Settings.normalizedPlate(draft)
-        if !p.isEmpty && !Settings.plateValid(p) {
+        let p = Settings.normalizedPlate(plate)
+        guard Settings.plateValid(p) else {
             note = "车牌格式不对：省份简称 + 发牌机关字母 + 5 或 6 位序号，例如 京A12345、京AD12345"
             return
         }
-        settings.plateNumber = p
-        settings.vehicleType = vehicleType
-        settings.avoidRestriction = avoid
-        settings.applyVehicleSettings()
+        onSave(Settings.Vehicle(id: vehicle?.id ?? UUID().uuidString,
+                                name: name.trimmingCharacters(in: .whitespacesAndNewlines),
+                                plate: p, type: type))
         presentationMode.wrappedValue.dismiss()
     }
 }

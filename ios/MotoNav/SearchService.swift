@@ -22,6 +22,7 @@ final class SearchService: NSObject, ObservableObject {
     @Published var status = ""
     private var api: AMapSearchAPI?
     private var cache: [String: [Place]] = [:]         // 关键词 → 结果（只存在内存里）
+    private var geoDone: ((String) -> Void)?            // 点按地图 POI 后的逆地理编码回调
 
     override init() {
         super.init()
@@ -59,6 +60,24 @@ final class SearchService: NSObject, ObservableObject {
 
     func clear() { results = []; status = "" }
 
+    /// 点按地图上的 POI 时补一个地址（高德逆地理编码，注意 SDK 方法名是 ReGoecode）
+    func reverseGeocode(lat: Double, lng: Double, done: @escaping (String) -> Void) {
+        guard api != nil, !Settings.shared.amapKeyInUse.isEmpty else { done(""); return }
+        geoDone = done
+        let req = AMapReGeocodeSearchRequest()
+        req.location = AMapGeoPoint.location(withLatitude: CGFloat(lat), longitude: CGFloat(lng))
+        req.requireExtension = false
+        api?.aMapReGoecodeSearch(req)
+    }
+
+    @objc(onReGeocodeSearchDone:response:)
+    func mnRegeoDone(_ request: AMapReGeocodeSearchRequest?, response: AMapReGeocodeSearchResponse?) {
+        let addr = response?.regeocode?.formattedAddress ?? ""
+        let cb = geoDone
+        geoDone = nil
+        cb?(addr)
+    }
+
     @objc(onInputTipsSearchDone:response:)
     func mnTipsDone(_ request: AMapInputTipsSearchRequest?, response: AMapInputTipsSearchResponse?) {
         let tips = response?.tips ?? []
@@ -73,6 +92,7 @@ final class SearchService: NSObject, ObservableObject {
 
     @objc(AMapSearchRequest:didFailWithError:)
     func mnSearchFail(_ request: Any?, error: NSError?) {
+        if let g = geoDone { geoDone = nil; g("") }
         let code = error?.code ?? 0
         let bid = Bundle.main.bundleIdentifier ?? ""
         switch code {

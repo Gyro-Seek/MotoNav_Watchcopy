@@ -125,6 +125,23 @@ final class Settings: ObservableObject {
         VehicleType(code: 2, name: "纯电客车"),
         VehicleType(code: 4, name: "插混客车")
     ]
+
+    /// 苹果地图式「我的车辆」：可保存多台车，选中的那台用于限行判断
+    struct Vehicle: Identifiable, Codable, Equatable {
+        var id: String
+        var name: String
+        var plate: String
+        var type: Int
+        init(id: String = UUID().uuidString, name: String = "", plate: String = "", type: Int = 0) {
+            self.id = id
+            self.name = name
+            self.plate = plate
+            self.type = type
+        }
+    }
+    static func vehicleTypeName(_ code: Int) -> String {
+        vehicleTypes.first { $0.code == code }?.name ?? "燃油客车"
+    }
     /// 民用车牌的省份简称（设置页里点一下就能换省份，不用切中文键盘）
     static let plateProvinces: [String] = "京津冀晋蒙辽吉黑沪苏浙皖闽赣鲁豫鄂湘粤桂琼渝川贵云藏陕甘青宁新".map { String($0) }
 
@@ -145,6 +162,58 @@ final class Settings: ObservableObject {
     @Published var avoidRestriction: Bool { didSet { ud.set(avoidRestriction, forKey: "avoid_restriction") } }
     @Published var vehicleType: Int { didSet { ud.set(vehicleType, forKey: "vehicle_type") } }
 
+    // MARK: - 多车辆 + 界面深浅
+
+    @Published var savedVehicles: [Vehicle] { didSet { persistVehicles() } }
+    @Published var activeVehicleID: String { didSet { ud.set(activeVehicleID, forKey: "vehicle_active") } }
+    /// 界面外观：0 自动（日出日落）/ 1 浅色 / 2 深色，默认 0
+    @Published var uiAppearance: Int { didSet { ud.set(uiAppearance, forKey: "ui_appearance"); applyUITheme() } }
+    @Published private(set) var uiLight = false
+
+    func persistVehicles() {
+        if let d = try? JSONEncoder().encode(savedVehicles) { ud.set(d, forKey: "vehicle_list") }
+    }
+    func upsertVehicle(_ v: Vehicle) {
+        if let i = savedVehicles.firstIndex(where: { $0.id == v.id }) { savedVehicles[i] = v }
+        else { savedVehicles.append(v) }
+    }
+    func removeVehicle(id: String) {
+        savedVehicles.removeAll { $0.id == id }
+        if activeVehicleID == id { activeVehicleID = "" }
+    }
+    func selectVehicle(_ v: Vehicle) {
+        plateNumber = v.plate
+        vehicleType = v.type
+        activeVehicleID = v.id
+        applyVehicleSettings()
+    }
+    /// 自动模式直接取 NOAA 日出日落结果，不受「圆屏夜间配色」的手动档位影响。
+    /// applyDayNight() 每分钟检查一次并把它算好的 daylight 传进来。
+    func applyUITheme(daylight: Bool? = nil) {
+        let day: Bool
+        if let d = daylight {
+            day = d
+        } else {
+            // 这里刻意只碰 LocationService，避免 Settings 单例初始化时反向触发 NaviBridge 单例
+            let loc = LocationService.shared.location
+            day = SunTimes.isDaytime(lat: loc?.coordinate.latitude, lng: loc?.coordinate.longitude).day
+        }
+        let light: Bool
+        switch uiAppearance {
+        case 1: light = true
+        case 2: light = false
+        default: light = day
+        }
+        if uiLight != light { uiLight = light }
+    }
+    var uiAppearanceNote: String {
+        switch uiAppearance {
+        case 1: return "一直使用浅色玻璃"
+        case 2: return "一直使用深色玻璃"
+        default: return "按当地日出 / 日落自动在浅色与深色之间切换（\(nightDesc)）"
+        }
+    }
+
     /// 真正交给高德的车牌（已清洗）
     var plateInUse: String { Settings.normalizedPlate(plateNumber) }
     /// 限行规避现在是否生效
@@ -152,7 +221,9 @@ final class Settings: ObservableObject {
     /// 界面上一句话显示当前状态
     var plateSummary: String {
         guard Settings.plateValid(plateInUse) else { return "未设置车牌" }
-        return avoidRestriction ? "\(plateInUse) · 避开限行" : "\(plateInUse) · 未开启"
+        let n = savedVehicles.first { $0.id == activeVehicleID }?.name ?? ""
+        let head = n.isEmpty ? plateInUse : "\(n) · \(plateInUse)"
+        return avoidRestriction ? head + " · 避开限行" : head + " · 未开启"
     }
     /// 车牌 / 车型 / 开关改完调用：更新高德车辆信息，已经算过路线就重算一次
     func applyVehicleSettings() {
@@ -221,6 +292,19 @@ final class Settings: ObservableObject {
         plateNumber = ud.string(forKey: "vehicle_plate") ?? ""
         avoidRestriction = ud.object(forKey: "avoid_restriction") as? Bool ?? true
         vehicleType = ud.object(forKey: "vehicle_type") as? Int ?? 0
+        uiAppearance = ud.object(forKey: "ui_appearance") as? Int ?? 0
+        activeVehicleID = ud.string(forKey: "vehicle_active") ?? ""
+        if let d = ud.data(forKey: "vehicle_list"),
+           let arr = try? JSONDecoder().decode([Vehicle].self, from: d) {
+            savedVehicles = arr
+        } else {
+            savedVehicles = []
+        }
+        if savedVehicles.isEmpty, !plateNumber.isEmpty {
+            let legacy = Vehicle(name: "我的车", plate: Settings.normalizedPlate(plateNumber), type: vehicleType)
+            savedVehicles = [legacy]
+            activeVehicleID = legacy.id
+        }
         curve = ud.bool(forKey: "map_curve")
         duck = ud.object(forKey: "voice_duck") as? Bool ?? true
         voiceMuted = ud.bool(forKey: "nav_muted")
@@ -228,6 +312,9 @@ final class Settings: ObservableObject {
         mapSource = MapDefaults.source(ud)
         trail = ud.object(forKey: "map_trail") as? Int ?? 1
         clean = ud.bool(forKey: "clean_mode")
+        // 所有存储属性都初始化完以后再调用实例方法
+        persistVehicles()
+        applyUITheme()
     }
 
     private var brightTimer: Timer?
@@ -299,6 +386,7 @@ final class Settings: ObservableObject {
             brightSent = lv
             BleLink.shared.send("#b,\(lv)")
         }
+        applyUITheme(daylight: r.day)       // 界面深浅在自动模式下跟着日出日落变
     }
 }
 

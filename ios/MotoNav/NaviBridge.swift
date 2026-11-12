@@ -30,6 +30,11 @@ final class NaviBridge: NSObject, ObservableObject {
     @Published var routeReady = false
     @Published var navigating = false
     @Published var info = "（还没开始导航）"
+    // 车牌限行：只显示高德 SDK 真正返回的结果，不再写「已避开限行」这种未经验证的状态
+    @Published private(set) var vehicleInfoAccepted = false   // setVehicleInfo 是否被高德接受
+    @Published private(set) var restrictionType = -1          // AMapNaviRestrictionInfo.titleType
+    @Published private(set) var restrictionTitle = ""
+    private var vehicleRetry = 0
     @Published var routeSummary = ""
     // 给界面看
     @Published var uiDir = ""
@@ -214,11 +219,12 @@ final class NaviBridge: NSObject, ObservableObject {
 
     // MARK: - 车牌与限行
 
-    /// 算路前把车牌交给高德：AMapNaviVehicleInfo 的 vehicleId + isETARestriction + type。
-    /// 只有「车牌合法 + 开了避开限行」才把车牌写进去；关掉开关或删掉车牌时传空车牌并关掉限行开关，
-    /// 上一次算路留下的车辆信息就不会继续生效（不传 nil，兼容各版本 SDK 的参数声明）。
-    /// 高德拿到车牌后会在算路时规避当日尾号限行、外地牌限行等路段。
-    func applyVehicleInfo() {
+    /// 算路前把车牌交给高德：AMapNaviVehicleInfo.vehicleId + isETARestriction + type。
+    /// 高德官方：只有 isETARestriction = YES 且设置了车牌号，算路才会规避车辆限行。
+    /// setVehicleInfo 返回 BOOL，之前直接忽略返回值导致「车牌没生效但界面照样写已避开限行」；
+    /// 这里记录返回值，失败时（SDK 还没初始化完）1.2 秒后补一次。
+    @discardableResult
+    func applyVehicleInfo() -> Bool {
         let s = Settings.shared
         let plate = s.plateInUse
         let active = s.avoidRestriction && Settings.plateValid(plate)
@@ -226,7 +232,44 @@ final class NaviBridge: NSObject, ObservableObject {
         info.vehicleId = active ? plate : ""
         info.isETARestriction = active
         info.type = s.vehicleType
-        _ = manager.setVehicleInfo(info)
+        let ok = manager.setVehicleInfo(info)
+        vehicleInfoAccepted = ok && active
+        if ok {
+            vehicleRetry = 0
+        } else if active, vehicleRetry < 1 {
+            vehicleRetry += 1
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
+                guard let self = self else { return }
+                _ = self.applyVehicleInfo()
+            }
+        }
+        return ok
+    }
+
+    /// 高德 AMapNaviRestrictionInfo.titleType：2/7 已避开，0/1 建议设置车牌 / 开启限行，
+    /// 3/4/5 起终点或途经点在限行区域内（无法规避），6 途经限行区，8 到达时已失效。
+    var restrictionOK: Bool { restrictionType == 2 || restrictionType == 7 }
+
+    /// 界面上显示的、经过高德返回值证实的限行结论
+    var restrictionSummary: String {
+        let s = Settings.shared
+        guard s.restrictionActive else { return "未开启车牌限行规避" }
+        guard vehicleInfoAccepted else {
+            return "高德未接受车牌 \(s.plateInUse)：检查车牌格式、高德 Key 与导航 SDK 权限"
+        }
+        switch restrictionType {
+        case 2, 7: return "已按 \(s.plateInUse) 避开限行区域"
+        case 0:    return "高德提示：外地车限行，建议设置车牌"
+        case 1:    return "高德提示：外地车限行，建议开启限行规避"
+        case 3:    return "起点在限行区域内，无法规避"
+        case 4:    return "终点在限行区域内，无法规避"
+        case 5:    return "途经点在限行区域内，无法规避"
+        case 6:    return "路线仍经过限行区域"
+        case 8:    return "到达时限行已失效"
+        default:
+            if !restrictionTitle.isEmpty { return restrictionTitle }
+            return "已提交车牌 \(s.plateInUse)，本次路线未返回限行信息（该区域可能没有适用规则）"
+        }
     }
 
     /// 车牌 / 车型 / 限行开关改了：已经算过路线就按新车牌重算一次
@@ -298,6 +341,7 @@ final class NaviBridge: NSObject, ObservableObject {
         shareRoute = nil; vias = []
         calculating = false; routeReady = false; planFailed = false
         routeOptions = []; selectedRouteID = -1; shareMatch = ""; routeSummary = ""
+        restrictionType = -1; restrictionTitle = ""
         info = "（还没开始导航）"
     }
 
@@ -319,6 +363,7 @@ final class NaviBridge: NSObject, ObservableObject {
         calculating = true
         routeReady = false
         routeOptions = []; selectedRouteID = -1; shareMatch = ""
+        restrictionType = -1; restrictionTitle = ""
         let avoid = Settings.shared.avoidHighway
         let me = myPosition()
         var wps: [AMapNaviPoint] = []
@@ -1037,8 +1082,18 @@ extension NaviBridge {
         }
         routeOptions = opts
         info = opts.count > 1 ? "规划好了 \(opts.count) 条路线，点卡片选一条" : "路线规划好了"
+        // AMapNaviRoute.restrictionInfo 才是限行是否真的生效的证据；不再凭开关就宣称「已避开」
+        let picked = opts.first?.id ?? manager.naviRouteID
+        if let route = routes[NSNumber(value: picked)] ?? manager.naviRoute,
+           let ri = route.restrictionInfo {
+            restrictionType = ri.titleType
+            restrictionTitle = ri.title ?? ""
+        } else {
+            restrictionType = -1
+            restrictionTitle = ""
+        }
         if Settings.shared.restrictionActive {
-            info += " · 已按 \(Settings.shared.plateInUse) 避开限行"
+            info += " · " + restrictionSummary
         }
         if let f = opts.first { select(routeID: f.id) }
     }
