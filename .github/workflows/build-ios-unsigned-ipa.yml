@@ -3,15 +3,37 @@ name: 构建 MotoNav 未签名 IPA
 # 直接使用仓库里的 ios/ 工程，构建脚本内联，不依赖 scripts/ 目录。
 # 只手动触发，避免上传文件时自动跑半截失败。
 # 成功后在 Actions 页 Artifacts 下载 MotoNav-unsigned-IPA。
+#
+# runner 说明：macos-15 / macos-26 / macos-latest 走 Apple Silicon(arm64) 池，
+# 高峰期可能排队约 15 分钟后被判定「job was not acquired by Runner of type hosted」。
+# 遇到该报错时，在 Actions -> Run workflow 里把 runner 改成 macos-15-intel（Intel 池）再跑。
+# 本工程只编译 iPhone arm64 的未签名 IPA，Intel 主机可正常交叉编译，不依赖 Apple Silicon。
 on:
   workflow_dispatch:
+    inputs:
+      runner:
+        description: "托管 runner 标签（arm64 池排队失败时改选 Intel）"
+        required: true
+        default: macos-15
+        type: choice
+        options:
+          - macos-15
+          - macos-15-intel
+          - macos-26
+          - macos-26-intel
+          - macos-latest
 
 permissions:
   contents: read
 
+# 同一分支只保留最新一次运行，避免反复点「重跑」时多个任务同时排队抢同一个池。
+concurrency:
+  group: ios-unsigned-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
-    runs-on: macos-15
+    runs-on: ${{ github.event.inputs.runner || 'macos-15' }}
     timeout-minutes: 60
     steps:
       - name: 检出源码
@@ -19,6 +41,10 @@ jobs:
 
       - name: 仓库内容与工具链自检
         run: |
+          echo "== Runner =="
+          echo "label: ${{ github.event.inputs.runner || 'macos-15' }}"
+          echo "arch: $(uname -m)"
+          sw_vers
           echo "== 顶层 =="
           ls -la
           echo "== ios/ =="
