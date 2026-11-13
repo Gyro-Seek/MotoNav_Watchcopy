@@ -58,7 +58,7 @@ struct ContentView: View {
     @State private var suppressAutoSearch = false      // 程序化改 query 时不触发实时检索
     @State private var searchWork: DispatchWorkItem? = nil
     @State private var keyboardHeight: CGFloat = 0     // 键盘高度：把搜索面板顶到键盘上方
-    @AppStorage("map_layer") private var mapLayer = 0 // 0 地图 / 1 驾车（实时路况） / 2 卫星
+    @AppStorage("map_layer") private var mapLayer = 0 // 0 探索 / 1 驾车（实时路况） / 2 卫星
     @State private var mapRotated = false              // 地图被手动旋转、不是北向上
     @State private var northToken = 0                  // 左下角「回正」按钮
     @State private var poiSelected = false             // 地点来自点按地图（点空白处可收起）
@@ -497,75 +497,164 @@ struct ContentView: View {
         }
     }
 
-    /// 路线态（苹果地图式路线表）：出行方式 → 路线卡 → 途经 / 避让 → 开始导航
+    /// 路线态（苹果地图式）：标题栏 → 出行方式 → 起终点 / 添加停靠站 → 路线分页卡片。
+    /// 「添加停靠站」「左右滑动切换路线」照抄苹果地图交互；车辆与限行等次要信息
+    /// 下移到「上滑拉开抽屉」之后才显示，默认态不再露出半截文字。
     private var routePanel: some View {
         SheetBlock {
-            HStack(alignment: .top) {
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(dest?.name ?? "路线").font(.title3.bold()).foregroundColor(ContentView.ink).lineLimit(1)
-                    Text("驾车 · 高德导航").font(.caption).foregroundColor(ContentView.sub)
-                }
-                Spacer(minLength: 8)
-                Button { resetHome() } label: {
-                    Image(systemName: "xmark.circle.fill").foregroundColor(ContentView.sub)
-                }
-            }
-            routeModeChips
+            routeHeader
+            routeModeBar
+            routeStopsCard
             if let sr = navi.shareRoute {
                 Text("按高德分享的\(sr.kind)路线走（\(NaviBridge.distText(Int(sr.total)))）")
                     .font(.caption).foregroundColor(.orange)
                 if !navi.shareMatch.isEmpty { Text(navi.shareMatch).font(.caption).foregroundColor(ContentView.sub) }
-            }
-            if !navi.routeOptions.isEmpty {
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 10) {
-                        ForEach(navi.routeOptions) { o in
-                            RouteCard(option: o, selected: o.id == navi.selectedRouteID)
-                                .frame(width: 140)
-                                .onTapGesture {
-                                    if o.id == navi.selectedRouteID { showRouteDetail = true }
-                                    else { navi.select(routeID: o.id) }
-                                }
-                        }
-                    }
-                }
-            } else {
-                Text(navi.calculating ? "正在规划路线…" : (navi.planFailed ? "路线规划失败" : navi.info))
-                    .font(.footnote).foregroundColor(ContentView.sub)
             }
             if navi.planFailed && !navi.calculating {
                 Button { navi.replan() } label: {
                     Label("重新规划", systemImage: "arrow.clockwise").font(.subheadline).foregroundColor(ContentView.cyan)
                 }
             }
-            if navi.shareRoute == nil {
-                HStack(spacing: 10) {
-                    Text(viaSummary)
-                        .font(.caption).foregroundColor(ContentView.sub).lineLimit(2)
-                    Spacer(minLength: 4)
-                    Button { openViaManager() } label: {
-                        Label(navi.vias.isEmpty ? "添加途经点" : "途经点管理",
-                              systemImage: navi.vias.isEmpty ? "plus.circle" : "ellipsis.circle")
-                            .font(.caption).foregroundColor(ContentView.cyan)
-                    }
-                }
-            }
-            HStack(spacing: 12) {
-                Toggle("不走高速", isOn: $settings.avoidHighway)
-                    .font(.caption).foregroundColor(ContentView.ink).tint(ContentView.pink)
-                    .onChange(of: settings.avoidHighway) { _ in navi.replan() }
-                Spacer(minLength: 4)
-            }
-            plateRow
-            restrictionRow
+            // 只有上滑拉开抽屉后才展开：默认态完全看不到这些次要设置
+            if sheetExpanded { routeExtras }
         }
     }
 
-    /// 固定在抽屉底部的「开始导航」：不管上面列表滚到哪、抽屉多高，按钮都看得见
-    private var startNaviBar: some View {
-        VStack(spacing: 4) {
-            PillButton(title: "开始导航", color: ContentView.pink, enabled: navi.routeReady) {
-                navi.start(emulate: false); showNavi = true
+    /// 苹果地图式标题栏：左「路线详情」/ 中「路线 + 目的地」/ 右关闭
+    private var routeHeader: some View {
+        HStack(spacing: 8) {
+            Button { showRouteDetail = true } label: {
+                Image(systemName: "info.circle").font(.system(size: 16, weight: .semibold))
+                    .foregroundColor(ContentView.ink)
+                    .frame(width: 34, height: 34)
+                    .background(Circle().fill(ContentView.stroke.opacity(0.5)))
+            }
+            .accessibilityLabel("路线详情")
+            Spacer(minLength: 4)
+            VStack(spacing: 3) {
+                Text("路线").font(.headline).foregroundColor(ContentView.ink)
+                Text(dest?.name ?? "目的地").font(.caption2).foregroundColor(ContentView.bg)
+                    .lineLimit(1)
+                    .padding(.horizontal, 10).padding(.vertical, 3)
+                    .background(Capsule().fill(ContentView.cyan))
+            }
+            Spacer(minLength: 4)
+            Button { resetHome() } label: {
+                Image(systemName: "xmark").font(.system(size: 14, weight: .bold))
+                    .foregroundColor(ContentView.ink)
+                    .frame(width: 34, height: 34)
+                    .background(Circle().fill(ContentView.stroke.opacity(0.5)))
+            }
+            .accessibilityLabel("关闭路线")
+        }
+    }
+
+    /// 出行方式图标行（苹果地图式）；摩托车 / 自行车仍走独立网页规划
+    private var routeModeBar: some View {
+        HStack(spacing: 0) {
+            modeIcon("car.fill", active: true, action: {})
+            Spacer(minLength: 0)
+            modeIcon("flag.fill", active: false) { openWebMotor(.motorcycle) }
+            Spacer(minLength: 0)
+            modeIcon("bicycle", active: false) { openWebMotor(.bicycle) }
+        }
+        .padding(.horizontal, 8).padding(.vertical, 6)
+        .background(RoundedRectangle(cornerRadius: 14).fill(ContentView.stroke.opacity(0.35)))
+    }
+
+    private func modeIcon(_ icon: String, active: Bool,
+                          action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: icon).font(.system(size: 17, weight: .semibold))
+                .foregroundColor(active ? .white : ContentView.ink)
+                .frame(width: 46, height: 32)
+                .background(Capsule().fill(active ? ContentView.pink : Color.clear))
+        }
+        .buttonStyle(.plain)
+    }
+
+    /// 起终点 / 途经点 / 添加停靠站：照抄苹果地图的列表式停靠站卡片
+    private var routeStopsCard: some View {
+        VStack(spacing: 0) {
+            stopRow(icon: "location.fill", tint: ContentView.cyan,
+                    title: "我的位置", tag: "起点", handle: false)
+            Divider().background(ContentView.stroke)
+            ForEach(navi.vias) { v in
+                HStack(spacing: 10) {
+                    Image(systemName: "circle.fill").font(.system(size: 8))
+                        .foregroundColor(ContentView.cyan).frame(width: 22, height: 22)
+                    Text(v.name).font(.subheadline).foregroundColor(ContentView.ink).lineLimit(1)
+                    Spacer(minLength: 4)
+                    Button { navi.removeVia(id: v.id) } label: {
+                        Image(systemName: "minus.circle.fill").foregroundColor(ContentView.pink)
+                    }
+                    .buttonStyle(.borderless)
+                    Image(systemName: "line.horizontal.3").font(.caption).foregroundColor(ContentView.sub)
+                }
+                .padding(.vertical, 9)
+                Divider().background(ContentView.stroke)
+            }
+            stopRow(icon: "flag.fill", tint: ContentView.pink,
+                    title: dest?.name ?? "目的地", tag: "终点", handle: true)
+            Divider().background(ContentView.stroke)
+            Button { openViaSearch() } label: {
+                HStack(spacing: 10) {
+                    Image(systemName: "plus.circle.fill").font(.system(size: 20))
+                        .foregroundColor(ContentView.cyan)
+                    Text("添加停靠站").font(.subheadline).foregroundColor(ContentView.cyan)
+                    Spacer(minLength: 4)
+                    Image(systemName: "line.horizontal.3").font(.caption).foregroundColor(ContentView.sub)
+                }
+                .padding(.vertical, 9)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .disabled(navi.vias.count >= 3 || navi.shareRoute != nil)
+        }
+        .padding(.horizontal, 12).padding(.vertical, 4)
+        .background(RoundedRectangle(cornerRadius: 16).fill(ContentView.card.opacity(0.9)))
+        .overlay(RoundedRectangle(cornerRadius: 16).stroke(ContentView.stroke, lineWidth: 1))
+    }
+
+    private func stopRow(icon: String, tint: Color, title: String,
+                         tag: String, handle: Bool) -> some View {
+        HStack(spacing: 10) {
+            Image(systemName: icon).font(.system(size: 13, weight: .semibold))
+                .foregroundColor(ContentView.bg)
+                .frame(width: 22, height: 22)
+                .background(Circle().fill(tint))
+            Text(title).font(.subheadline).foregroundColor(ContentView.ink).lineLimit(1)
+            Spacer(minLength: 4)
+            Text(tag).font(.caption2).foregroundColor(ContentView.sub)
+            if handle { Image(systemName: "line.horizontal.3").font(.caption).foregroundColor(ContentView.sub) }
+        }
+        .padding(.vertical, 9)
+    }
+
+    /// 固定在抽屉底部的路线分页卡片：左右滑动切换方案（苹果地图式分页圆点）
+    /// + 卡片内「出发」按钮；始终可见，不受上面列表滚动影响。
+    private var routePagerBar: some View {
+        VStack(spacing: 6) {
+            if navi.routeOptions.isEmpty {
+                HStack {
+                    Text(navi.calculating ? "正在规划路线…" : (navi.planFailed ? "路线规划失败" : navi.info))
+                        .font(.subheadline).foregroundColor(ContentView.sub)
+                    Spacer(minLength: 4)
+                }
+                .padding(14)
+                .background(RoundedRectangle(cornerRadius: 18).fill(ContentView.card))
+            } else {
+                TabView(selection: Binding(
+                    get: { navi.routeOptions.first(where: { $0.id == navi.selectedRouteID })?.id
+                           ?? navi.routeOptions.first?.id ?? -1 },
+                    set: { newID in navi.select(routeID: newID) }
+                )) {
+                    ForEach(navi.routeOptions) { o in
+                        routePageCard(o).tag(o.id)
+                    }
+                }
+                .tabViewStyle(.page(indexDisplayMode: .always))
+                .frame(height: 116)
             }
             HStack {
                 Spacer()
@@ -574,6 +663,42 @@ struct ContentView: View {
                     .disabled(!navi.routeReady)
             }
         }
+    }
+
+    /// 每页一个路线方案：时间 / 抵达时间 · 里程 / 标签 + 「出发」
+    private func routePageCard(_ o: NaviBridge.RouteOption) -> some View {
+        HStack(alignment: .center, spacing: 10) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(NaviBridge.durText(o.timeS)).font(.title2.bold())
+                    .foregroundColor(ContentView.ink).lineLimit(1).minimumScaleFactor(0.75)
+                Text(etaText(o.timeS) + " 抵达 · " + NaviBridge.distText(o.length))
+                    .font(.caption).foregroundColor(ContentView.sub).lineLimit(1)
+                Text(o.label + (o.lights > 0 ? " · \(o.lights) 灯" : "") + (o.toll > 0 ? " · ¥\(o.toll)" : ""))
+                    .font(.caption2).foregroundColor(ContentView.pink).lineLimit(1)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
+            .onTapGesture { showRouteDetail = true }   // 点卡片信息区看路线详情
+            Spacer(minLength: 6)
+            Button {
+                navi.select(routeID: o.id)
+                navi.start(emulate: false); showNavi = true
+            } label: {
+                Text("出发").font(.headline).foregroundColor(.white)
+                    .frame(width: 78, height: 52)
+                    .background(RoundedRectangle(cornerRadius: 14).fill(Color.green))
+            }
+            .buttonStyle(.plain)
+            .disabled(!navi.routeReady)
+        }
+        .padding(14)
+        .background(RoundedRectangle(cornerRadius: 18).fill(ContentView.card))
+        .overlay(RoundedRectangle(cornerRadius: 18).stroke(ContentView.stroke, lineWidth: 1))
+    }
+
+    private func etaText(_ s: Int) -> String {
+        let f = DateFormatter(); f.dateFormat = "HH:mm"
+        return f.string(from: Date().addingTimeInterval(TimeInterval(s)))
     }
 
     /// 高德 SDK 本次算路真实返回的限行结论（AMapNaviRoute.restrictionInfo）
@@ -591,24 +716,27 @@ struct ContentView: View {
         }
     }
 
-    /// 出行方式：驾车留在本地高德导航，摩托车 / 自行车跳到独立路线规划
-    private var routeModeChips: some View {
-        HStack(spacing: 8) {
-            Label("驾车", systemImage: "car.fill")
-                .font(.caption).foregroundColor(.white)
-                .padding(.horizontal, 12).padding(.vertical, 7)
-                .background(Capsule().fill(ContentView.pink.opacity(0.85)))
-            Button { openWebMotor(.motorcycle) } label: {
-                Label("摩托车", systemImage: "flag.fill").font(.caption).foregroundColor(ContentView.cyan)
-                    .padding(.horizontal, 12).padding(.vertical, 7)
-                    .background(Capsule().fill(ContentView.bg))
+    /// 次要设置：默认态收起，上滑拉开抽屉后才完整显示
+    private var routeExtras: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            if navi.shareRoute == nil {
+                HStack(spacing: 10) {
+                    Text(viaSummary).font(.caption).foregroundColor(ContentView.sub).lineLimit(2)
+                    Spacer(minLength: 4)
+                    Button { openViaManager() } label: {
+                        Label("途经点管理", systemImage: "ellipsis.circle")
+                            .font(.caption).foregroundColor(ContentView.cyan)
+                    }
+                }
             }
-            Button { openWebMotor(.bicycle) } label: {
-                Label("自行车", systemImage: "bicycle").font(.caption).foregroundColor(ContentView.cyan)
-                    .padding(.horizontal, 12).padding(.vertical, 7)
-                    .background(Capsule().fill(ContentView.bg))
+            HStack(spacing: 12) {
+                Toggle("不走高速", isOn: $settings.avoidHighway)
+                    .font(.caption).foregroundColor(ContentView.ink).tint(ContentView.pink)
+                    .onChange(of: settings.avoidHighway) { _ in navi.replan() }
+                Spacer(minLength: 4)
             }
-            Spacer(minLength: 0)
+            plateRow
+            restrictionRow
         }
     }
 
@@ -711,9 +839,9 @@ struct ContentView: View {
         hideKeyboard()
         searchWork?.cancel()
         addingVia = false
-        setQuery("")
+        setQuery(dest?.name ?? "")
         search.clear()
-        viaManager = true
+        viaManager = false
         homeStage = .routes
     }
 
@@ -754,7 +882,7 @@ struct ContentView: View {
             setQuery(dest?.name ?? "")
             if !needAmapKey() { navi.addVia(name: p.name, lat: p.lat, lng: p.lng) }
             History.shared.add(p)
-            viaManager = true          // 加完回管理页，可继续增删 / 排序
+            viaManager = false         // 加完直接回路线面板：停靠站卡片里立刻看到新点
             homeStage = .routes
             overviewToken += 1
             return
@@ -987,18 +1115,18 @@ struct ContentView: View {
         }
     }
 
-    /// 右上角地图按钮：苹果地图式「地图 / 驾车（路况） / 卫星」三选一。
+    /// 右上角地图按钮：三选一「探索 / 驾车 / 卫星」（从上往下）。
     /// 界面深浅、标准 / 夜间地图配色统一放到设置里，默认自动跟随日出日落。
     private var mapControls: some View {
         Menu {
             Button { mapLayer = 0 } label: {
-                Label("地图", systemImage: mapLayer == 0 ? "checkmark" : "map")
+                Label("探索", systemImage: mapLayer == 0 ? "checkmark" : "map")
             }
             Button { mapLayer = 1 } label: {
-                Label("驾车（实时路况）", systemImage: mapLayer == 1 ? "checkmark" : "car.fill")
+                Label("驾车", systemImage: mapLayer == 1 ? "checkmark" : "car.fill")
             }
             Button { mapLayer = 2 } label: {
-                Label("卫星图", systemImage: mapLayer == 2 ? "checkmark" : "globe")
+                Label("卫星", systemImage: mapLayer == 2 ? "checkmark" : "globe")
             }
         } label: {
             MapGlassButton(icon: mapLayer == 1 ? "car.fill" : (mapLayer == 2 ? "globe" : "map"),
@@ -1029,11 +1157,13 @@ struct ContentView: View {
     private func panelHeight(_ geo: GeometryProxy) -> CGFloat {
         let raw: CGFloat
         if drawerMinimized { raw = 122 }
-        else if sheetExpanded { raw = min(geo.size.height * 0.55, 430) }
+        else if sheetExpanded { raw = min(geo.size.height * (homeStage == .routes ? 0.72 : 0.55), homeStage == .routes ? 600 : 430) }
         else if viaManager { raw = min(geo.size.height * 0.58, 440) }
         else if addingVia { raw = min(geo.size.height * 0.50, 380) }
-        else if homeStage == .place { raw = 200 }
-        else if homeStage == .routes { raw = min(geo.size.height * 0.52, 400) }
+        // 图1：抓手 + 搜索框 + 地点标题/地址 + 「收藏 / 路线」两个按钮要完整露出，不再被底边裁掉
+        else if homeStage == .place { raw = 300 }
+        // 图2/图3：苹果地图式停靠站卡片 + 底部分页卡片，默认态给足高度
+        else if homeStage == .routes { raw = min(geo.size.height * 0.62, 470) }
         else { raw = hasSearchContent ? min(geo.size.height * 0.50, 380) : 122 }
         let avail = geo.size.height - keyboardHeight - 20
         return min(raw, max(122, avail))
@@ -1090,7 +1220,7 @@ struct ContentView: View {
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 if canStartNavi {
-                    startNaviBar
+                    routePagerBar
                         .padding(.horizontal, 14)
                         .padding(.bottom, 6)
                 }
@@ -1965,12 +2095,14 @@ final class HomeMapDelegate: NSObject, UIGestureRecognizerDelegate {
         }
     }
 
-    /// 点空白处收起地点卡；延迟 0.3s 是为了让 didTouchPois 先处理，避免误收
+    /// 点空白处收起地点卡；延迟 0.3s 是为了让 didTouchPois 先处理，避免误收。
+    /// 判定窗口必须明显大于 0.30s 的延迟：否则刚点中 POI 弹出的地点卡，会在 0.30s 后被
+    /// 同一次 tap 的 didSingleTap 当成「点空白」立刻 resetHome()，表现为「跳出来一秒又没了」。
     @objc(mapView:didSingleTappedAtCoordinate:)
     func didSingleTap(_ m: MAMapView, coordinate: CLLocationCoordinate2D) {
         let hit = tapHitsSelectedRoute(m, coordinate)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.30) { [weak self] in
-            guard let s = self, Date().timeIntervalSince(s.lastPoiAt) > 0.28 else { return }
+            guard let s = self, Date().timeIntervalSince(s.lastPoiAt) > 0.6 else { return }
             if hit { DispatchQueue.main.async { s.onRouteTap?() } }
             else { s.onBlankTap?() }
         }
@@ -2296,6 +2428,7 @@ private struct RouteDetailView: View {
     @ObservedObject private var navi = NaviBridge.shared
     @ObservedObject private var settings = Settings.shared
     @Environment(\.presentationMode) private var presentationMode
+    @State private var showPlateSetup = false
     let destName: String
 
     private var selected: NaviBridge.RouteOption? {
@@ -2365,11 +2498,47 @@ private struct RouteDetailView: View {
                     HStack { Text("车牌"); Spacer(); Text(settings.plateNumber.isEmpty ? "未填写" : settings.plateNumber).foregroundColor(ContentView.sub) }
                 }
 
-                if settings.restrictionActive {
-                    Section(header: Text("限行结论")) {
+                Section(header: Text("限行政策 · 引用与解决办法")) {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("引用依据").font(.caption).foregroundColor(ContentView.sub)
+                        Text("高德导航 SDK 本次算路返回的限行结论（AMapNaviRoute.restrictionInfo，titleType = \(navi.restrictionType)）")
+                            .font(.footnote).foregroundColor(ContentView.ink)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Text("限行规则由各地公安机关交通管理部门发布，按车牌尾号、外地号牌、限行时段与区域执行。本页仅引用高德按车牌 \(plateDisplay) 计算的结果，不代表官方认定。")
+                            .font(.footnote).foregroundColor(ContentView.sub)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    .padding(.vertical, 4)
+
+                    HStack(alignment: .top, spacing: 8) {
+                        Image(systemName: navi.restrictionOK ? "checkmark.shield.fill" : "exclamationmark.shield.fill")
+                            .foregroundColor(navi.restrictionOK ? .green : .orange)
                         Text(navi.restrictionSummary).font(.footnote).foregroundColor(ContentView.ink)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("解决办法").font(.caption).foregroundColor(ContentView.sub)
+                        ForEach(restrictionAdvice, id: \.self) { a in
+                            HStack(alignment: .top, spacing: 6) {
+                                Image(systemName: "circle.fill").font(.system(size: 5))
+                                    .foregroundColor(ContentView.cyan).padding(.top, 6)
+                                Text(a).font(.footnote).foregroundColor(ContentView.ink)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                        }
+                    }
+                    .padding(.vertical, 4)
+
+                    Text("以当地公安交管部门最新通告及「交管 12123」为准，出行前请再次核对当日尾号与限行时段。")
+                        .font(.caption2).foregroundColor(ContentView.sub)
+
+                    Button { showPlateSetup = true } label: {
+                        Label("去设置车牌 / 避开限行", systemImage: "car.fill")
+                            .font(.subheadline).foregroundColor(ContentView.cyan)
                     }
                 }
+                .sheet(isPresented: $showPlateSetup) { PlateSetupView() }
             }
             .listStyle(.insetGrouped)
             .navigationTitle("路线详情")
@@ -2390,6 +2559,48 @@ private struct RouteDetailView: View {
             Text(title).font(.caption2).foregroundColor(ContentView.sub)
         }
         .frame(maxWidth: .infinity)
+    }
+
+    private var plateDisplay: String {
+        settings.plateNumber.isEmpty ? "（未填写）" : settings.plateNumber
+    }
+
+    /// 按高德返回的 titleType 给出针对性处置建议：引用 SDK 结论 + 通用解决办法
+    private var restrictionAdvice: [String] {
+        if !settings.restrictionActive {
+            return ["在「车辆与限行」里填写车牌并开启「规划路线时避开限行」，高德算路才会规避限行区域。",
+                    "未开启时各方案均按不限行计算，请自行核对当日尾号与限行时段。"]
+        }
+        switch navi.restrictionType {
+        case 0:
+            return ["高德提示外地车限行：先补全车牌（含省份简称），再重新规划。",
+                    "若确为外地号牌，可改走绕城 / 高速外围，或把出发时间挪到限行时段之外。"]
+        case 1:
+            return ["当前未开启限行规避：在「车辆与限行」打开「规划路线时避开限行」后重新规划。",
+                    "也可左右滑动切换到其他方案，或错开限行时段出发。"]
+        case 3:
+            return ["起点本身在限行区域内，任何路线都无法规避：把车停在限行区外再设为起点。",
+                    "或改用公交 / 地铁接驳，或按当地规定申请临时通行证。"]
+        case 4:
+            return ["终点在限行区域内，任何路线都无法规避：把目的地改到限行区外的停车场再步行 / 接驳。",
+                    "确认是否为边界误判，可微调目的地坐标后重新规划。"]
+        case 5:
+            return ["某个停靠站落在限行区域内：删除该停靠站，或移到限行区外。",
+                    "限行时段内无法经过时，可调整停靠站顺序或改在非限行时段通过。"]
+        case 6:
+            return ["本方案仍穿过限行区域：左右滑动切换其他方案，或开启「避开限行」后重新规划。",
+                    "也可错开限行时段出发，或改经绕城道路绕行。"]
+        case 8:
+            return ["按预计到达时间限行已结束，本方案可通行。",
+                    "若实际行程延误，仍可能在限行时段内进入，请预留时间余量。"]
+        case 2, 7:
+            return ["高德已按当前车牌避开限行区域，可直接使用本方案。",
+                    "如临时更换车辆，记得在「车辆与限行」切换车牌并重新规划。"]
+        default:
+            return ["本次算路未返回限行结论：该区域可能没有适用于本车牌的规则，或高德未接受车牌。",
+                    "出行前请通过「交管 12123」或当地交警官网核对当日限行规定。",
+                    "若车牌格式有误，在「车辆与限行」修正后重新规划。"]
+        }
     }
 
     private func eta(_ s: Int) -> String {

@@ -354,12 +354,30 @@ final class Settings: ObservableObject {
 
     private var nightSent = -1
     private var dayNightTimer: Timer?
+    private var catchupTicks = 0
 
     /// App 启动时调用一次
     func startDayNight() {
         dayNightTimer?.invalidate()
-        dayNightTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in self?.applyDayNight() }
+        // 先立刻算一次：界面外观 / 地图配色的「自动」模式启动即生效，不用等第一个周期
         applyDayNight()
+        // 冷启动这一刻通常还没有经纬度，SunTimes 会先按兜底的 6:30~18:30 计算，
+        // 于是「自动」要等 60s 后第一个周期拿到定位才切到正确配色（用户感知约 1 分钟延迟）。
+        // 前 1 分钟改用 5s 短周期「追赶定位」：拿到真实位置立刻按当地日出日落重算，
+        // 之后切回 60s 常规周期。纯本地计算，只有值变化才会发蓝牙指令，长期不增加耗电。
+        catchupTicks = 0
+        dayNightTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
+            guard let s = self else { return }
+            s.applyDayNight()
+            s.catchupTicks += 1
+            let hasFix = (NaviBridge.shared.lastLocation ?? LocationService.shared.location) != nil
+            if hasFix || s.catchupTicks >= 12 {
+                s.dayNightTimer?.invalidate()
+                s.dayNightTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
+                    self?.applyDayNight()
+                }
+            }
+        }
     }
 
     /// 算出现在是白天还是夜间：夜间配色、亮度变了就告诉圆屏
