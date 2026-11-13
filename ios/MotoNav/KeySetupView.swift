@@ -22,7 +22,7 @@ struct KeySetupView: View {
                     // 高德
                     CardView {
                         HStack {
-                            Text("高德 Key").foregroundColor(.white).bold()
+                            Text("高德 Key").foregroundColor(ContentView.ink).bold()
                             Text("必填").font(.caption).foregroundColor(ContentView.pink)
                             Spacer()
                             Text(Settings.mask(settings.amapKeyInUse)).font(.caption).foregroundColor(ContentView.sub)
@@ -65,14 +65,17 @@ struct KeySetupView: View {
             .navigationTitle("Key 设置")
             .navigationBarTitleDisplayMode(.inline)
         }
-        .preferredColorScheme(.dark)
+        // 不再强制深色：此前 CardView / ContentView.bg 按 Settings.uiLight 取色（浅色下为白底），
+        // 而这里强制 .dark 会让未指定颜色的系统控件与硬编码白字变成白字，出现「白底白字」。
+        // 统一跟随 App 全局外观后，浅色=白底深字、深色=深底白字，两者始终配套。
     }
 
     private func step(_ n: Int, _ t: String) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Text("\(n)").font(.caption.bold()).foregroundColor(.black)
+            // 数字色随明暗反转：浅色圆是深蓝、深色圆是亮青，两种模式都能读清
+            Text("\(n)").font(.caption.bold()).foregroundColor(ContentView.bg)
                 .frame(width: 18, height: 18).background(Circle().fill(ContentView.cyan))
-            Text(t).font(.footnote).foregroundColor(.white).fixedSize(horizontal: false, vertical: true)
+            Text(t).font(.footnote).foregroundColor(ContentView.ink).fixedSize(horizontal: false, vertical: true)
         }
     }
 
@@ -80,7 +83,7 @@ struct KeySetupView: View {
         HStack {
             TextField(placeholder, text: text)
                 .textFieldStyle(.plain)
-                .foregroundColor(.white)
+                .foregroundColor(ContentView.ink)
                 .disableAutocorrection(true)
                 .textInputAutocapitalization(.never)
             Button("粘贴") { if let s = UIPasteboard.general.string { text.wrappedValue = s.trimmingCharacters(in: .whitespacesAndNewlines) } }

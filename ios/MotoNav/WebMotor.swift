@@ -378,6 +378,6 @@ struct WebMotorView: View {
         Group {
             if guide.running || guide.arrived { IndependentNavigationView() }
             else { IndependentPlannerView(mode:mode) }
-        }.preferredColorScheme(.dark)
+        }
     }
 }

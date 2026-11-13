@@ -72,7 +72,7 @@ struct PlacePickerView: View {
                     }
                 }
             }.navigationTitle(title).toolbar{ToolbarItem(placement:.cancellationAction){Button("取消"){dismiss()}}}
-        }.preferredColorScheme(.dark)
+        }
     }
 }
 
@@ -139,7 +139,7 @@ struct IndependentPlannerView: View {
                 }.padding(16)
             }.background(ContentView.bg).navigationTitle("\(mode.rawValue)路线")
                 .toolbar{ToolbarItem(placement:.cancellationAction){Button("返回首页"){dismiss()}}}
-        }.foregroundColor(.white).tint(ContentView.pink)
+        }.foregroundColor(ContentView.ink).tint(ContentView.pink)
         .sheet(isPresented:Binding(get:{pick != nil},set:{if !$0{pick=nil}})){
             PlacePickerView(title:pick==0 ? "选择起点" : pick==2 ? "选择途经点" : "选择目的地"){point in
                 if pick==0{model.start=point}else if pick==2{model.vias.append(point)}else{model.end=point}
@@ -202,7 +202,7 @@ struct IndependentNavigationView: View {
                 VStack(spacing:18){Text("已到达目的地").font(.title.bold());Button("返回首页"){guide.arrived=false;dismiss()}}
                     .padding(30).background(RoundedRectangle(cornerRadius:22).fill(ContentView.bg)).frame(maxHeight:.infinity)
             }
-        }.foregroundColor(.white).tint(ContentView.pink)
+        }.foregroundColor(ContentView.ink).tint(ContentView.pink)
         .alert("结束导航？",isPresented:$confirmExit){Button("结束",role:.destructive){guide.stop();guide.arrived=false;dismiss()};Button("继续导航",role:.cancel){}}
     }
     private var arrow:String {

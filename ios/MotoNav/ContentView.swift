@@ -493,8 +493,6 @@ struct ContentView: View {
                             .background(Capsule().fill(ContentView.cyan))
                     }
                 }
-                Text("上滑面板看更多；点地图空白处可收起")
-                    .font(.caption2).foregroundColor(ContentView.sub)
             }
         }
     }
@@ -531,11 +529,6 @@ struct ContentView: View {
                         }
                     }
                 }
-                Button { showRouteDetail = true } label: {
-                    Label("路线详情", systemImage: "list.bullet.rectangle")
-                        .font(.caption).foregroundColor(ContentView.cyan)
-                }
-                .buttonStyle(.borderless)
             } else {
                 Text(navi.calculating ? "正在规划路线…" : (navi.planFailed ? "路线规划失败" : navi.info))
                     .font(.footnote).foregroundColor(ContentView.sub)
@@ -1052,8 +1045,6 @@ struct ContentView: View {
         let showList = !drawerMinimized && (sheetExpanded || viaManager || addingVia || homeStage != .idle || hasSearchContent)
         let canStartNavi = !drawerMinimized && homeStage == .routes && !viaManager && !addingVia
         return VStack(spacing: 0) {
-            if !showList { Spacer(minLength: 0) }
-
             VStack(spacing: 0) {
                 Capsule().fill(ContentView.ink.opacity(0.28)).frame(width: 42, height: 5)
                     .frame(maxWidth: .infinity, minHeight: 20)
@@ -1103,6 +1094,9 @@ struct ContentView: View {
                         .padding(.horizontal, 14)
                         .padding(.bottom, 6)
                 }
+            } else {
+                // 最小态：空白留在搜索框下方，抓手+搜索框贴抽屉顶部，与展开态位置一致
+                Spacer(minLength: 0)
             }
             Color.clear.frame(height: bottomSafe)   // 底部安全区：背景铺到屏幕下沿，内容避开 home indicator
                 .contentShape(Rectangle())
@@ -1141,12 +1135,12 @@ struct ContentView: View {
         }
     }
 
-    /// 下滑：先收「展开」，再收成只剩搜索条的最小态，能一路缩到底
+    /// 下滑：一次直接收成只剩搜索条的最小态（不再分两级，展开态下拉一次即可到底）
     private func collapseDrawer() {
         hideKeyboard()
         withAnimation(.spring(response: 0.34, dampingFraction: 0.86)) {
-            if sheetExpanded { sheetExpanded = false }
-            else { drawerMinimized = true }
+            sheetExpanded = false
+            drawerMinimized = true
         }
     }
 
@@ -1239,7 +1233,7 @@ struct ContentView: View {
     private var settingsHub: some View {
         NavigationView {
             List {
-                Section(header: Text("地图与外观"), footer: Text(settings.uiAppearanceNote)) {
+                Section(header: Text("地图与外观")) {
                     Picker("界面外观", selection: $settings.uiAppearance) {
                         Text("自动（日出日落）").tag(0)
                         Text("浅色").tag(1)
@@ -1251,8 +1245,6 @@ struct ContentView: View {
                         Text("标准").tag(1)
                         Text("夜间").tag(2)
                     }
-                    Text("「驾车」地图会在底图上叠加实时拥堵路况；在右上角地图按钮里切换。")
-                        .font(.caption).foregroundColor(ContentView.sub)
                 }
                 Section(header: Text("导航与路线")) {
                     Button { hubPlate = true } label: {

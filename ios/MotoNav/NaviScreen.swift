@@ -10,7 +10,8 @@ import ObjectiveC
 /// - 地图跟着夜间配色切换白天 / 夜间样式
 /// - 到达目的地后显示 4 秒“已到达”，然后自动关掉（圆屏同时显示到达，4 秒后回到待机）
 /// iOS v0.6：播报静音按钮（下次还记得）；模拟导航暂停 / 继续、车速 40/60/100/150；
-/// “退出导航”要长按（防误触），高德界面的“关闭”按钮先问一句
+/// 退出导航统一用高德界面自带的“关闭”按钮（弹确认）或“更多”菜单；
+/// 不再叠加自定义的大按钮，避免与高德自带底栏重叠
 
 /// 接住高德导航界面的按钮回调（和 NaviBridge 一样在运行时登记协议，见 CLAUDE.md 高德坑第 1 条）
 final class DriveViewController: NSObject, ObservableObject {
@@ -67,8 +68,6 @@ struct NaviScreen: View {
     @StateObject private var drive = DriveViewController()
     @Environment(\.dismiss) private var dismiss
     @State private var confirmClose = false
-    @State private var holding = false                  // 正在长按“退出导航”
-    @State private var holdHint = false
 
     var body: some View {
         ZStack(alignment: .bottom) {
@@ -90,7 +89,9 @@ struct NaviScreen: View {
                 }
                 if !navi.showArrived {
                     controlRow
-                    exitButton
+                        // 原「长按退出导航」大按钮已移除；这里留出等高空间，
+                        // 让高德导航界面自带的「退出 / 到达时间 / 设置」底栏完整露出，不再重叠
+                        .padding(.bottom, 82)
                 }
             }
             if navi.showArrived { arrivedCard }
@@ -147,35 +148,6 @@ struct NaviScreen: View {
                 .background(Capsule().fill(Color.black.opacity(0.82)))
         }
         .buttonStyle(.plain)
-    }
-
-    /// 长按 0.6 秒才退出（骑车时误碰不会退）；按住时粉色从左往右填满
-    private var exitButton: some View {
-        ZStack(alignment: .leading) {
-            Capsule().fill(Color(red: 0.45, green: 0.14, blue: 0.32))
-            GeometryReader { g in
-                Capsule().fill(Color(red: 1, green: 0.31, blue: 0.71))
-                    .frame(width: holding ? g.size.width : 0)
-                    .animation(holding ? .linear(duration: 0.6) : .easeOut(duration: 0.15), value: holding)
-            }
-            Text(holdHint ? "要长按才能退出" : (holding ? "松手取消" : "长按退出导航"))
-                .font(.headline)
-                .foregroundColor(.white)
-                .frame(maxWidth: .infinity)
-        }
-        .frame(height: 48)
-        .clipShape(Capsule())
-        .contentShape(Capsule())
-        .onTapGesture {
-            holdHint = true
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { holdHint = false }
-        }
-        .onLongPressGesture(minimumDuration: 0.6, pressing: { p in holding = p }) {
-            holding = false
-            exitNavi()
-        }
-        .padding(.horizontal, 24)
-        .padding(.bottom, 24)
     }
 
     /// 到达目的地：显示 4 秒后自动关掉（点一下马上关）
