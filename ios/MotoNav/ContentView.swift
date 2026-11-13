@@ -47,6 +47,8 @@ struct ContentView: View {
     @Environment(\.scenePhase) private var scenePhase
     @State private var lastHandledShare = ""        // 去重：onOpenURL 和前台自动消费可能同时到
     @State private var sheetExpanded = false         // 首页底部搜索抽屉：上滑展开更多入口
+    @State private var drawerMinimized = false      // 下拉到底：抽屉缩回只剩搜索条
+    @State private var showRouteDetail = false      // 苹果地图式：点选中路线看详细信息
     @State private var homeStage: HomeStage = .idle  // 首页流程：搜索 → 地点 → 路线
     @State private var homeFocus: CLLocationCoordinate2D? = nil   // 选中的地点（地图相机目标）
     @State private var focusToken = 0                  // 每选一次地点 +1，触发地图定位
@@ -107,6 +109,9 @@ struct ContentView: View {
         .sheet(isPresented: $showKeys) { KeySetupView() }
         .sheet(isPresented: $showPlate) { PlateSetupView() }
         .sheet(isPresented: $showSettings) { settingsHub }
+        .sheet(isPresented: $showRouteDetail) { RouteDetailView(destName: dest?.name ?? "") }
+        // 换了阶段（搜索 / 地点 / 路线）就自动恢复抽屉，避免停在「缩到最小」的状态
+        .onChange(of: homeStage) { _ in drawerMinimized = false }
         .onAppear {                                    // iOS v0.7 打开 App 时，高德 key 没填就提醒一次
             if !ContentView.keyPrompted && settings.keysMissing {
                 ContentView.keyPrompted = true
@@ -519,10 +524,18 @@ struct ContentView: View {
                         ForEach(navi.routeOptions) { o in
                             RouteCard(option: o, selected: o.id == navi.selectedRouteID)
                                 .frame(width: 140)
-                                .onTapGesture { navi.select(routeID: o.id) }
+                                .onTapGesture {
+                                    if o.id == navi.selectedRouteID { showRouteDetail = true }
+                                    else { navi.select(routeID: o.id) }
+                                }
                         }
                     }
                 }
+                Button { showRouteDetail = true } label: {
+                    Label("路线详情", systemImage: "list.bullet.rectangle")
+                        .font(.caption).foregroundColor(ContentView.cyan)
+                }
+                .buttonStyle(.borderless)
             } else {
                 Text(navi.calculating ? "正在规划路线…" : (navi.planFailed ? "路线规划失败" : navi.info))
                     .font(.footnote).foregroundColor(ContentView.sub)
@@ -552,6 +565,12 @@ struct ContentView: View {
             }
             plateRow
             restrictionRow
+        }
+    }
+
+    /// 固定在抽屉底部的「开始导航」：不管上面列表滚到哪、抽屉多高，按钮都看得见
+    private var startNaviBar: some View {
+        VStack(spacing: 4) {
             PillButton(title: "开始导航", color: ContentView.pink, enabled: navi.routeReady) {
                 navi.start(emulate: false); showNavi = true
             }
@@ -933,7 +952,8 @@ struct ContentView: View {
                         bottomInset: panelHeight(geo) + keyboardHeight,
                         onRotation: { rotated in mapRotated = rotated },
                         onPoiTap: { name, coord in selectMapPoi(name: name, coord: coord) },
-                        onBlankTap: { if poiSelected && homeStage == .place { resetHome() } }
+                        onBlankTap: { if poiSelected && homeStage == .place { resetHome() } },
+                        onRouteTap: { if homeStage == .routes { showRouteDetail = true } }
                     )
                     .ignoresSafeArea()
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -967,8 +987,9 @@ struct ContentView: View {
                         .padding(.trailing, 16)
                         .padding(.bottom, panelHeight(geo) + keyboardHeight + 14)
                 }
-                homeDrawer(height: panelHeight(geo))
+                homeDrawer(height: panelHeight(geo), bottomSafe: geo.safeAreaInsets.bottom)
                     .ignoresSafeArea(edges: .bottom)
+                    .offset(y: geo.safeAreaInsets.bottom)
             }
         }
     }
@@ -986,7 +1007,6 @@ struct ContentView: View {
             Button { mapLayer = 2 } label: {
                 Label("卫星图", systemImage: mapLayer == 2 ? "checkmark" : "globe")
             }
-            Text("界面深浅与地图配色在「设置」里，默认自动")
         } label: {
             MapGlassButton(icon: mapLayer == 1 ? "car.fill" : (mapLayer == 2 ? "globe" : "map"),
                            active: mapLayer != 0)
@@ -1015,7 +1035,8 @@ struct ContentView: View {
     /// 面板高度跟着阶段走；键盘弹起时收窄，保证搜索框始终看得见
     private func panelHeight(_ geo: GeometryProxy) -> CGFloat {
         let raw: CGFloat
-        if sheetExpanded { raw = min(geo.size.height * 0.55, 430) }
+        if drawerMinimized { raw = 122 }
+        else if sheetExpanded { raw = min(geo.size.height * 0.55, 430) }
         else if viaManager { raw = min(geo.size.height * 0.58, 440) }
         else if addingVia { raw = min(geo.size.height * 0.50, 380) }
         else if homeStage == .place { raw = 200 }
@@ -1026,9 +1047,10 @@ struct ContentView: View {
     }
 
     /// 抽屉：抓手 + 搜索框固定；上滑展开最近去过 / 常用目的地 / 快捷功能。
-    /// 背景延伸到屏幕最底部（忽略底部安全区），内容留 34pt 避开 home indicator。
-    private func homeDrawer(height: CGFloat) -> some View {
-        let showList = sheetExpanded || viaManager || addingVia || homeStage != .idle || hasSearchContent
+    /// 背景延伸到屏幕物理底边（底边直角 + 忽略底部安全区），内容按 bottomSafe 留白避开 home indicator。
+    private func homeDrawer(height: CGFloat, bottomSafe: CGFloat) -> some View {
+        let showList = !drawerMinimized && (sheetExpanded || viaManager || addingVia || homeStage != .idle || hasSearchContent)
+        let canStartNavi = !drawerMinimized && homeStage == .routes && !viaManager && !addingVia
         return VStack(spacing: 0) {
             if !showList { Spacer(minLength: 0) }
 
@@ -1043,10 +1065,10 @@ struct ContentView: View {
                     homeSearchBar.padding(.horizontal, 14).padding(.bottom, 10)
                 }
             }
-            // 手势只加在「抓手 + 搜索框」区域，避免和下面列表滚动打架
+            // 手势只加在「抓手 + 搜索框」区域：上滑展开，下拉逐级收起直到只剩搜索条
             .gesture(DragGesture(minimumDistance: 24).onEnded { v in
-                if v.translation.height < -45 { setSheet(true) }
-                else if v.translation.height > 45 { setSheet(false) }
+                if v.translation.height < -45 { expandDrawer() }
+                else if v.translation.height > 45 { collapseDrawer() }
             })
 
             if showList {
@@ -1076,22 +1098,26 @@ struct ContentView: View {
                     .padding(.horizontal, 14).padding(.bottom, 18)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else {
-                Color.clear.frame(height: 34)     // 底部留白，避开 home indicator
-                    .contentShape(Rectangle())
-                    .onTapGesture { hideKeyboard() }
+                if canStartNavi {
+                    startNaviBar
+                        .padding(.horizontal, 14)
+                        .padding(.bottom, 6)
+                }
             }
+            Color.clear.frame(height: bottomSafe)   // 底部安全区：背景铺到屏幕下沿，内容避开 home indicator
+                .contentShape(Rectangle())
+                .onTapGesture { hideKeyboard() }
         }
-        .frame(height: height)
+        .frame(height: height + bottomSafe)
         .frame(maxWidth: .infinity)
         .background(
             ZStack {
-                RoundedRectangle(cornerRadius: 22, style: .continuous).fill(.ultraThinMaterial)
-                RoundedRectangle(cornerRadius: 22, style: .continuous)
+                TopRoundedShape(radius: 22).fill(.ultraThinMaterial)
+                TopRoundedShape(radius: 22)
                     .fill(Settings.shared.uiLight ? Color.white.opacity(0.55) : ContentView.card.opacity(0.94))
             }
         )
-        .overlay(RoundedRectangle(cornerRadius: 22, style: .continuous).stroke(ContentView.stroke, lineWidth: 1))
+        .overlay(TopRoundedShape(radius: 22, closed: false).stroke(ContentView.stroke, lineWidth: 1))
         .animation(.spring(response: 0.34, dampingFraction: 0.86), value: homeStage)
         .animation(.spring(response: 0.34, dampingFraction: 0.86), value: sheetExpanded)
         .animation(.spring(response: 0.34, dampingFraction: 0.86), value: hasSearchContent)
@@ -1100,12 +1126,36 @@ struct ContentView: View {
     }
 
     private func setSheet(_ v: Bool) {
-        withAnimation(.spring(response: 0.34, dampingFraction: 0.86)) { sheetExpanded = v }
+        withAnimation(.spring(response: 0.34, dampingFraction: 0.86)) {
+            if v { drawerMinimized = false }
+            sheetExpanded = v
+        }
+    }
+
+    /// 上滑：从最小态一路恢复成展开态
+    private func expandDrawer() {
+        hideKeyboard()
+        withAnimation(.spring(response: 0.34, dampingFraction: 0.86)) {
+            drawerMinimized = false
+            sheetExpanded = true
+        }
+    }
+
+    /// 下滑：先收「展开」，再收成只剩搜索条的最小态，能一路缩到底
+    private func collapseDrawer() {
+        hideKeyboard()
+        withAnimation(.spring(response: 0.34, dampingFraction: 0.86)) {
+            if sheetExpanded { sheetExpanded = false }
+            else { drawerMinimized = true }
+        }
     }
 
     private func toggleSheet() {
         hideKeyboard()                    // 点抓手也算「点空白处」，先把键盘收掉
-        withAnimation(.spring(response: 0.34, dampingFraction: 0.86)) { sheetExpanded.toggle() }
+        withAnimation(.spring(response: 0.34, dampingFraction: 0.86)) {
+            if drawerMinimized { drawerMinimized = false; sheetExpanded = true }
+            else { sheetExpanded.toggle() }
+        }
     }
 
     /// 点按地图上的 POI：落针 + 地图定位 + 底部地点卡（苹果地图式）；逆地理编码补地址
@@ -1696,6 +1746,7 @@ struct HomeMapView: UIViewRepresentable {
     var onRotation: ((Bool) -> Void)? = nil
     var onPoiTap: ((String, CLLocationCoordinate2D) -> Void)? = nil
     var onBlankTap: (() -> Void)? = nil
+    var onRouteTap: (() -> Void)? = nil
 
     /// 坐标指纹：把字符串插值从长链式表达式里拆出来
     private static func coordKey(_ c: CLLocationCoordinate2D?) -> String {
@@ -1728,7 +1779,14 @@ struct HomeMapView: UIViewRepresentable {
         c.onRotation = onRotation
         c.onPoiTap = onPoiTap
         c.onBlankTap = onBlankTap
+        c.onRouteTap = onRouteTap
         c.watchRotation(map)
+        // 苹果地图式「双击后按住上滑放大 / 下滑缩小」；不干扰 SDK 自带的单击、拖动与捏合
+        let zd = ZoomDragRecognizer()
+        zd.map = map
+        zd.cancelsTouchesInView = false
+        zd.delegate = c
+        map.addGestureRecognizer(zd)
         return map
     }
 
@@ -1740,6 +1798,8 @@ struct HomeMapView: UIViewRepresentable {
         c.onRotation = onRotation
         c.onPoiTap = onPoiTap
         c.onBlankTap = onBlankTap
+        c.onRouteTap = onRouteTap
+        c.selectedCoords = routes.first(where: { $0.id == selectedRouteID })?.coords ?? []
         c.watchRotation(map)
 
         if c.northSeq != northToken {
@@ -1812,7 +1872,7 @@ struct HomeMapView: UIViewRepresentable {
 /// 地图回调：选中路线主色粗线、备选灰色、分享原路线橙色虚线；目的地红针、途经点紫针。
 /// 当前位置用苹果式蓝色圆点（白边 + 浅蓝精度圈），不再用高德默认的大头针。
 /// 与工程里的 RouteMapDelegate 同样用运行时登记协议，避开 Swift / 高德 SDK 方法名冲突。
-final class HomeMapDelegate: NSObject {
+final class HomeMapDelegate: NSObject, UIGestureRecognizerDelegate {
     var key = ""
     var focusSeq = -1
     var recenterSeq = -1
@@ -1821,6 +1881,11 @@ final class HomeMapDelegate: NSObject {
     var onRotation: ((Bool) -> Void)?
     var onPoiTap: ((String, CLLocationCoordinate2D) -> Void)?
     var onBlankTap: (() -> Void)?
+    var onRouteTap: (() -> Void)?
+    var selectedCoords: [CLLocationCoordinate2D] = []
+    /// 自定义缩放手势与高德 SDK 自带手势同时识别，否则会被系统判为互斥而失效
+    func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
+                           shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool { true }
     private var rotationTimer: Timer?
     private var rotated = false
     private var lastPoiAt = Date.distantPast
@@ -1911,10 +1976,36 @@ final class HomeMapDelegate: NSObject {
     /// 点空白处收起地点卡；延迟 0.3s 是为了让 didTouchPois 先处理，避免误收
     @objc(mapView:didSingleTappedAtCoordinate:)
     func didSingleTap(_ m: MAMapView, coordinate: CLLocationCoordinate2D) {
+        let hit = tapHitsSelectedRoute(m, coordinate)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.30) { [weak self] in
             guard let s = self, Date().timeIntervalSince(s.lastPoiAt) > 0.28 else { return }
-            s.onBlankTap?()
+            if hit { DispatchQueue.main.async { s.onRouteTap?() } }
+            else { s.onBlankTap?() }
         }
+    }
+
+    /// 点击位置是否落在「已选中的路线」附近：按当前缩放级别换算约 26pt 的命中半径
+    private func tapHitsSelectedRoute(_ m: MAMapView, _ c: CLLocationCoordinate2D) -> Bool {
+        let pts = selectedCoords
+        guard pts.count >= 2 else { return false }
+        let rad = c.latitude * Double.pi / 180.0
+        let metersPerPoint = 156543.03392 * cos(rad) / pow(2.0, Double(m.zoomLevel))
+        let limit = metersPerPoint * 26.0
+        let kx = 111320.0 * cos(rad), ky = 110540.0
+        func xy(_ p: CLLocationCoordinate2D) -> (Double, Double) {
+            ((p.longitude - c.longitude) * kx, (p.latitude - c.latitude) * ky)
+        }
+        var prev = xy(pts[0])
+        for i in 1..<pts.count {
+            let cur = xy(pts[i])
+            let dx = cur.0 - prev.0, dy = cur.1 - prev.1
+            let len2 = dx * dx + dy * dy
+            let t = len2 > 0 ? max(0.0, min(1.0, -(prev.0 * dx + prev.1 * dy) / len2)) : 0.0
+            let ex = prev.0 + t * dx, ey = prev.1 + t * dy
+            if ex * ex + ey * ey <= limit * limit { return true }
+            prev = cur
+        }
+        return false
     }
 
     @objc(mapView:rendererForOverlay:)
@@ -2126,5 +2217,196 @@ struct VehicleEditorView: View {
                                 name: name.trimmingCharacters(in: .whitespacesAndNewlines),
                                 plate: p, type: type))
         presentationMode.wrappedValue.dismiss()
+    }
+}
+
+// MARK: - 抽屉底板：只有顶部两个圆角，底边直角贴齐屏幕物理底边
+/// 原来四角圆角 + 底边停在安全区上沿，屏幕最下端会露出一条地图；
+/// 现在底边是直线并向下延伸一个 bottomSafe，抽屉与屏幕下沿之间不再有缝。
+private struct TopRoundedShape: Shape {
+    var radius: CGFloat = 22
+    var closed = true
+    func path(in rect: CGRect) -> Path {
+        let r = min(radius, min(rect.width, rect.height) / 2)
+        var p = Path()
+        p.move(to: CGPoint(x: 0, y: rect.height))
+        p.addLine(to: CGPoint(x: 0, y: r))
+        p.addQuadCurve(to: CGPoint(x: r, y: 0), control: CGPoint(x: 0, y: 0))
+        p.addLine(to: CGPoint(x: rect.width - r, y: 0))
+        p.addQuadCurve(to: CGPoint(x: rect.width, y: r), control: CGPoint(x: rect.width, y: 0))
+        p.addLine(to: CGPoint(x: rect.width, y: rect.height))
+        if closed { p.closeSubpath() }
+        return p
+    }
+}
+
+// MARK: - 苹果地图式「双击后按住拖动缩放」
+/// 第二次按下时 UITouch.tapCount == 2，系统已经替我们认出了「再点一次」；
+/// 此时接管：上滑放大、下滑缩小，期间临时关闭地图平移，松手恢复。
+/// 用 tapCount 判定，不会把「单击后正常拖动地图」误当成缩放。
+final class ZoomDragRecognizer: UIGestureRecognizer {
+    weak var map: MAMapView?
+    private var tracked: UITouch?
+    private var startY: CGFloat = 0
+    private var baseZoom: CGFloat = 16
+    private var active = false
+
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {
+        super.touchesBegan(touches, with: event)
+        guard !active, let t = touches.first(where: { $0.tapCount >= 2 }) else { return }
+        active = true
+        tracked = t
+        startY = t.location(in: view).y
+        baseZoom = map?.zoomLevel ?? 16
+        // 用 KVC 关掉 SDK 平移，避开不同 SDK 版本对布尔属性 Swift 导入名的差异
+        map?.setValue(NSNumber(value: false), forKey: "scrollEnabled")
+        state = .began
+    }
+
+    override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent) {
+        super.touchesMoved(touches, with: event)
+        guard active, let t = tracked, touches.contains(t), let m = map else { return }
+        state = .changed
+        let dy = startY - t.location(in: m).y            // 上滑为正 → 放大
+        let z = min(20.0, max(3.0, Double(baseZoom) + Double(dy) / 80.0))
+        m.setZoomLevel(CGFloat(z), animated: false)
+    }
+
+    override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent) {
+        super.touchesEnded(touches, with: event)
+        finish(touches)
+    }
+
+    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent) {
+        super.touchesCancelled(touches, with: event)
+        finish(touches)
+    }
+
+    private func finish(_ touches: Set<UITouch>) {
+        guard active, let t = tracked, touches.contains(t) else { return }
+        state = .ended
+        map?.setValue(NSNumber(value: true), forKey: "scrollEnabled")
+        active = false
+        tracked = nil
+    }
+
+    override func reset() {
+        super.reset()
+        if active { map?.setValue(NSNumber(value: true), forKey: "scrollEnabled") }
+        active = false
+        tracked = nil
+    }
+}
+
+// MARK: - 苹果地图式「路线详情」
+/// 点按已选中的路线卡、或者点按地图上的蓝色路线折线，都会弹出这一页。
+private struct RouteDetailView: View {
+    @ObservedObject private var navi = NaviBridge.shared
+    @ObservedObject private var settings = Settings.shared
+    @Environment(\.presentationMode) private var presentationMode
+    let destName: String
+
+    private var selected: NaviBridge.RouteOption? {
+        navi.routeOptions.first { $0.id == navi.selectedRouteID } ?? navi.routeOptions.first
+    }
+
+    var body: some View {
+        NavigationView {
+            List {
+                if let o = selected {
+                    Section(header: Text("当前路线")) {
+                        HStack(alignment: .firstTextBaseline, spacing: 8) {
+                            Text(NaviBridge.durText(o.timeS))
+                                .font(.largeTitle.bold()).foregroundColor(ContentView.ink)
+                            Spacer(minLength: 8)
+                            Text(o.label).font(.caption).foregroundColor(ContentView.pink)
+                        }
+                        Text(NaviBridge.distText(o.length) + " · 预计 " + eta(o.timeS) + " 到达")
+                            .font(.subheadline).foregroundColor(ContentView.sub)
+                        HStack(spacing: 12) {
+                            metric("traffic.light", "红绿灯", "\(o.lights) 个")
+                            metric("yensign.circle", "过路费", o.toll > 0 ? "¥\(o.toll)" : "无")
+                            metric("speedometer", "平均时速", String(format: "%.0f km/h", speed(o)))
+                        }
+                        .padding(.vertical, 4)
+                    }
+                }
+
+                if navi.routeOptions.count > 1 {
+                    Section(header: Text("其他方案")) {
+                        ForEach(navi.routeOptions) { o in
+                            Button {
+                                navi.select(routeID: o.id)
+                            } label: {
+                                HStack(spacing: 10) {
+                                    VStack(alignment: .leading, spacing: 3) {
+                                        Text(o.label).font(.subheadline).foregroundColor(ContentView.ink)
+                                        Text(NaviBridge.durText(o.timeS) + " · " + NaviBridge.distText(o.length)
+                                             + " · \(o.lights)灯" + (o.toll > 0 ? " · ¥\(o.toll)" : ""))
+                                            .font(.caption).foregroundColor(ContentView.sub)
+                                    }
+                                    Spacer(minLength: 6)
+                                    if o.id == navi.selectedRouteID {
+                                        Image(systemName: "checkmark.circle.fill").foregroundColor(ContentView.pink)
+                                    }
+                                }
+                            }
+                            .buttonStyle(.borderless)
+                        }
+                    }
+                }
+
+                Section(header: Text("路线设置"),
+                        footer: Text("路线数据由高德导航 SDK 提供。点按地图上的蓝色路线或已选中的路线卡，可再次打开本页。")) {
+                    HStack { Text("出发地"); Spacer(); Text("我的位置").foregroundColor(ContentView.sub) }
+                    HStack { Text("目的地"); Spacer(); Text(destName.isEmpty ? "—" : destName).foregroundColor(ContentView.sub).lineLimit(1) }
+                    if !navi.vias.isEmpty {
+                        HStack(alignment: .top) {
+                            Text("途经点")
+                            Spacer()
+                            Text(navi.vias.map { $0.name }.joined(separator: " → "))
+                                .foregroundColor(ContentView.sub).lineLimit(2)
+                        }
+                    }
+                    HStack { Text("不走高速"); Spacer(); Text(settings.avoidHighway ? "开" : "关").foregroundColor(ContentView.sub) }
+                    HStack { Text("避开限行"); Spacer(); Text(settings.avoidRestriction ? "开" : "关").foregroundColor(ContentView.sub) }
+                    HStack { Text("车牌"); Spacer(); Text(settings.plateNumber.isEmpty ? "未填写" : settings.plateNumber).foregroundColor(ContentView.sub) }
+                }
+
+                if settings.restrictionActive {
+                    Section(header: Text("限行结论")) {
+                        Text(navi.restrictionSummary).font(.footnote).foregroundColor(ContentView.ink)
+                    }
+                }
+            }
+            .listStyle(.insetGrouped)
+            .navigationTitle("路线详情")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("完成") { presentationMode.wrappedValue.dismiss() }
+                        .foregroundColor(ContentView.cyan)
+                }
+            }
+        }
+    }
+
+    private func metric(_ icon: String, _ title: String, _ value: String) -> some View {
+        VStack(spacing: 4) {
+            Image(systemName: icon).font(.subheadline).foregroundColor(ContentView.cyan)
+            Text(value).font(.subheadline.bold()).foregroundColor(ContentView.ink).lineLimit(1).minimumScaleFactor(0.7)
+            Text(title).font(.caption2).foregroundColor(ContentView.sub)
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    private func eta(_ s: Int) -> String {
+        let f = DateFormatter(); f.dateFormat = "HH:mm"
+        return f.string(from: Date().addingTimeInterval(TimeInterval(s)))
+    }
+
+    private func speed(_ o: NaviBridge.RouteOption) -> Double {
+        guard o.timeS > 0 else { return 0 }
+        return Double(o.length) / Double(o.timeS) * 3.6
     }
 }
