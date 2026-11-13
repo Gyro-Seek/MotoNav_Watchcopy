@@ -74,6 +74,54 @@ final class NaviBridge: NSObject, ObservableObject {
     /// 给首页地图用的路况分段：把选中路线折线染成绿 / 黄 / 红 / 深红（苹果地图式）
     @Published var trafficSegs: [TrafficSeg] = []
 
+    /// 本次选中路线相对其他备选方案「避开 / 改走」的具体道路（取自高德 AMapNaviLink.roadName）
+    struct RoadBrief {
+        var avoided: [String] = []       // 其他方案走、本方案不走的道路
+        var used: [String] = []          // 本方案走、其他方案不走的道路
+        var mainRoads: [String] = []     // 本方案途经的主要道路（按里程排序）
+        var hasAlternatives = false      // 是否有其他方案可对比
+    }
+    @Published private(set) var roadBrief = RoadBrief()
+
+    /// 按 AMapNaviLink.roadName 统计每条道路的里程，取主要道路（roadName 是 SDK 官方文档确认的属性）
+    private func roadNames(of r: AMapNaviRoute) -> [String] {
+        var meters: [String: Int] = [:]
+        for s in r.routeSegments {
+            for l in s.links {
+                // roadName 在不同 SDK 版本里可能导入为 String / String? / String!，
+                // 用 as? String 统一兼容，非可选时也不会触发 nil 合并的编译错误
+                guard let n = l.roadName as? String, !n.isEmpty else { continue }
+                meters[n, default: 0] += l.length
+            }
+        }
+        return meters.sorted { $0.value > $1.value }.prefix(12).map { $0.key }
+    }
+
+    /// 把选中方案与其他备选方案的道路名做差集：避开的线路 / 改走的线路。
+    /// 只有一个方案时没有对比基准，交给界面显示「本方案途经的主要道路」，不编造线路。
+    func refreshRoadBrief(_ routes: [NSNumber: AMapNaviRoute]? = nil, pickedID: Int? = nil) {
+        let rs = routes ?? manager.naviRoutes ?? [:]
+        let pid = pickedID ?? manager.naviRouteID
+        guard let picked = rs[NSNumber(value: pid)] ?? (pid == manager.naviRouteID ? manager.naviRoute : nil) else {
+            roadBrief = RoadBrief(); return
+        }
+        let main = roadNames(of: picked)
+        var others = Set<String>()
+        var alt = false
+        for (k, r) in rs where k.intValue != pid {
+            if r.routeSegments.isEmpty { continue }
+            alt = true
+            others.formUnion(roadNames(of: r))
+        }
+        var b = RoadBrief(mainRoads: Array(main.prefix(6)), hasAlternatives: alt)
+        if alt {
+            let mainSet = Set(main)
+            b.avoided = Array(others.subtracting(mainSet).sorted().prefix(6))
+            b.used = Array(main.filter { !others.contains($0) }.prefix(6))
+        }
+        roadBrief = b
+    }
+
     /// 从高德导航 SDK 的路况光柱生成按米数的分段；算路成功、切换方案、导航中回调都会刷新。
     /// 数据是 SDK 已验证可用的 getTrafficStatuses() / AMapNaviTrafficStatus，未引入新 API。
     func refreshTrafficSegs(_ input: [AMapNaviTrafficStatus]? = nil) {
@@ -374,6 +422,7 @@ final class NaviBridge: NSObject, ObservableObject {
         calculating = false; routeReady = false; planFailed = false
         routeOptions = []; selectedRouteID = -1; shareMatch = ""; routeSummary = ""
         trafficSegs = []
+        roadBrief = RoadBrief()
         restrictionType = -1; restrictionTitle = ""
         info = "（还没开始导航）"
     }
@@ -396,6 +445,7 @@ final class NaviBridge: NSObject, ObservableObject {
         calculating = true
         routeReady = false
         routeOptions = []; selectedRouteID = -1; shareMatch = ""
+        roadBrief = RoadBrief()
         restrictionType = -1; restrictionTitle = ""
         let avoid = Settings.shared.avoidHighway
         let me = myPosition()
@@ -450,6 +500,7 @@ final class NaviBridge: NSObject, ObservableObject {
         }
         checkShareMatch()
         refreshTrafficSegs()          // 切换方案后刷新该路线的路况着色
+        refreshRoadBrief(pickedID: routeID)   // 换方案后重算「避开 / 改走」线路
     }
 
     static func distText(_ m: Int) -> String { m >= 1000 ? String(format: "%.1f 公里", Double(m) / 1000) : "\(m) 米" }
@@ -1130,6 +1181,8 @@ extension NaviBridge {
             info += " · " + restrictionSummary
         }
         if let f = opts.first { select(routeID: f.id) }
+        // 与备选方案对比，得出本方案避开 / 改走的具体道路（来自 AMapNaviLink.roadName）
+        refreshRoadBrief(routes, pickedID: selectedRouteID >= 0 ? selectedRouteID : manager.naviRouteID)
         // 算路成功后取一次路况；部分 SDK 版本光柱稍晚才填充，0.6s 后补读一次
         refreshTrafficSegs()
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in

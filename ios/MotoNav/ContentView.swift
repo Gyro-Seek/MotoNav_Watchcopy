@@ -44,11 +44,14 @@ struct ContentView: View {
     @State private var addingVia = false               // 正在搜途经点
     @State private var viaManager = false              // 途经点管理面板（增删 / 拖动排序）
     @State private var viaEditMode = EditMode.active   // 途经点列表常显拖拽手柄
+    @State private var viaDragID: UUID? = nil          // 停靠站卡片里正在拖动的途经点
+    @State private var viaDragY: CGFloat = 0           // 拖动时的纵向偏移（视觉反馈）
     @Environment(\.scenePhase) private var scenePhase
     @State private var lastHandledShare = ""        // 去重：onOpenURL 和前台自动消费可能同时到
     @State private var sheetExpanded = false         // 首页底部搜索抽屉：上滑展开更多入口
     @State private var drawerMinimized = false      // 下拉到底：抽屉缩回只剩搜索条
     @State private var showRouteDetail = false      // 苹果地图式：点选中路线看详细信息
+    @State private var showRouteOptions = false     // 苹果地图式「路线选项」二级菜单（车牌胶囊进入）
     @State private var homeStage: HomeStage = .idle  // 首页流程：搜索 → 地点 → 路线
     @State private var homeFocus: CLLocationCoordinate2D? = nil   // 选中的地点（地图相机目标）
     @State private var focusToken = 0                  // 每选一次地点 +1，触发地图定位
@@ -109,7 +112,8 @@ struct ContentView: View {
         .sheet(isPresented: $showKeys) { KeySetupView() }
         .sheet(isPresented: $showPlate) { PlateSetupView() }
         .sheet(isPresented: $showSettings) { settingsHub }
-        .sheet(isPresented: $showRouteDetail) { RouteDetailView(destName: dest?.name ?? "") }
+        .sheet(isPresented: $showRouteDetail) { RouteDetailView() }
+        .sheet(isPresented: $showRouteOptions) { RouteOptionsView() }
         // 换了阶段（搜索 / 地点 / 路线）就自动恢复抽屉，避免停在「缩到最小」的状态
         .onChange(of: homeStage) { _ in drawerMinimized = false }
         .onAppear {                                    // iOS v0.7 打开 App 时，高德 key 没填就提醒一次
@@ -498,7 +502,7 @@ struct ContentView: View {
     }
 
     /// 路线态（苹果地图式）：标题栏 → 出行方式 → 起终点 / 添加停靠站 → 路线分页卡片。
-    /// 抽屉只有一段高度，上滑不再展开第二段；「不走高速 / 避开限行 / 车牌」在路线详情页设置。
+    /// 抽屉只有一段高度，上滑不再展开第二段；「不走高速 / 避开限行 / 车牌」收进「路线选项」二级菜单。
     private var routePanel: some View {
         SheetBlock {
             routeHeader
@@ -515,7 +519,7 @@ struct ContentView: View {
                 }
             }
             // 抽屉改为单段后不再追加次要设置：「途经 / 途径点管理」由「添加停靠站」取代，
-            // 「不走高速 / 避开限行 / 车辆与限行」统一收进路线详情页，避免半截文字
+            // 「不走高速 / 避开限行 / 车辆与限行」统一收进「路线选项」二级菜单，避免半截文字
         }
     }
 
@@ -532,10 +536,14 @@ struct ContentView: View {
             Spacer(minLength: 4)
             VStack(spacing: 3) {
                 Text("路线").font(.headline).foregroundColor(ContentView.ink)
-                Text(dest?.name ?? "目的地").font(.caption2).foregroundColor(ContentView.bg)
-                    .lineLimit(1)
-                    .padding(.horizontal, 10).padding(.vertical, 3)
-                    .background(Capsule().fill(ContentView.cyan))
+                Button { showRouteOptions = true } label: {
+                    Text(plateBadgeText).font(.caption2).foregroundColor(ContentView.bg)
+                        .lineLimit(1)
+                        .padding(.horizontal, 10).padding(.vertical, 3)
+                        .background(Capsule().fill(ContentView.cyan))
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("路线选项")
             }
             Spacer(minLength: 4)
             Button { resetHome() } label: {
@@ -546,6 +554,14 @@ struct ContentView: View {
             }
             .accessibilityLabel("关闭路线")
         }
+    }
+
+    /// 标题下方胶囊：当前使用车辆的备注，没备注就直接显示车牌
+    private var plateBadgeText: String {
+        let p = settings.plateInUse
+        guard Settings.plateValid(p) else { return "设置车牌" }
+        let note = settings.savedVehicles.first { $0.id == settings.activeVehicleID }?.name ?? ""
+        return note.isEmpty ? p : note
     }
 
     /// 出行方式图标行（苹果地图式）；摩托车 / 自行车仍走独立网页规划
@@ -588,9 +604,30 @@ struct ContentView: View {
                         Image(systemName: "minus.circle.fill").foregroundColor(ContentView.pink)
                     }
                     .buttonStyle(.borderless)
+                    // 右侧把手现在真的能拖动：上下跨过一行即调序，松手后只重新规划一次
                     Image(systemName: "line.horizontal.3").font(.caption).foregroundColor(ContentView.sub)
+                        .frame(width: 30, height: 30)
+                        .contentShape(Rectangle())
+                        .highPriorityGesture(
+                            DragGesture(minimumDistance: 6)
+                                .onChanged { g in
+                                    viaDragID = v.id
+                                    viaDragY = g.translation.height
+                                }
+                                .onEnded { g in
+                                    let rows = Int((g.translation.height / 44).rounded())
+                                    if rows != 0, let from = navi.vias.firstIndex(where: { $0.id == v.id }) {
+                                        let to = min(max(from + rows, 0), navi.vias.count - 1)
+                                        navi.moveVia(from: from, to: to)
+                                    }
+                                    viaDragID = nil
+                                    viaDragY = 0
+                                }
+                        )
                 }
                 .padding(.vertical, 9)
+                .offset(y: viaDragID == v.id ? viaDragY : 0)
+                .zIndex(viaDragID == v.id ? 1 : 0)
                 Divider().background(ContentView.stroke)
             }
             stopRow(icon: "flag.fill", tint: ContentView.pink,
@@ -2478,14 +2515,105 @@ final class ZoomDragRecognizer: UIGestureRecognizer {
     }
 }
 
+// MARK: - 苹果地图式「路线选项」二级菜单
+/// 从路线标题下的车牌胶囊进入：版式参考苹果地图「时间和选项」，
+/// 内容 = 原「路线设置」板块的两个开关 + 车牌 + 「去设置车牌 / 避开限行」入口；
+/// 不再显示出发地 / 目的地和那段解释说明。
+private struct RouteOptionsView: View {
+    @ObservedObject private var settings = Settings.shared
+    @ObservedObject private var navi = NaviBridge.shared
+    @Environment(\.presentationMode) private var presentationMode
+    @State private var showPlateSetup = false
+
+    /// 当前使用的车辆：有备注就「备注 · 车牌」，没有就只显示车牌
+    private var plateText: String {
+        let p = settings.plateInUse
+        guard Settings.plateValid(p) else { return "未设置车牌" }
+        let note = settings.savedVehicles.first { $0.id == settings.activeVehicleID }?.name ?? ""
+        return note.isEmpty ? p : "\(note) · \(p)"
+    }
+
+    var body: some View {
+        NavigationView {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 22) {
+                    Text("车辆").font(.subheadline).foregroundColor(ContentView.sub)
+
+                    HStack(spacing: 10) {
+                        Image(systemName: "car.fill").foregroundColor(ContentView.cyan)
+                        Text(plateText).font(.body).foregroundColor(ContentView.ink).lineLimit(1)
+                        Spacer(minLength: 6)
+                        Image(systemName: "checkmark").foregroundColor(ContentView.cyan)
+                    }
+                    .padding(.horizontal, 14).padding(.vertical, 12)
+                    .background(RoundedRectangle(cornerRadius: 14).fill(ContentView.card))
+
+                    Button { showPlateSetup = true } label: {
+                        HStack(spacing: 10) {
+                            Image(systemName: "gearshape.fill").foregroundColor(ContentView.cyan)
+                            Text("去设置车牌 / 避开限行").font(.body).foregroundColor(ContentView.cyan)
+                            Spacer(minLength: 6)
+                            Image(systemName: "chevron.right").font(.caption).foregroundColor(ContentView.sub)
+                        }
+                        .padding(.horizontal, 14).padding(.vertical, 12)
+                        .background(RoundedRectangle(cornerRadius: 14).fill(ContentView.card))
+                    }
+                    .buttonStyle(.plain)
+
+                    Text("避开").font(.subheadline).foregroundColor(ContentView.sub)
+
+                    VStack(spacing: 0) {
+                        Toggle("不走高速", isOn: $settings.avoidHighway)
+                            .font(.body).foregroundColor(ContentView.ink).tint(ContentView.pink)
+                            .onChange(of: settings.avoidHighway) { _ in navi.replan() }
+                            .padding(.vertical, 8)
+                        Divider().background(ContentView.stroke)
+                        Toggle("规划路线时避开限行", isOn: $settings.avoidRestriction)
+                            .font(.body).foregroundColor(ContentView.ink).tint(ContentView.pink)
+                            .onChange(of: settings.avoidRestriction) { _ in settings.applyVehicleSettings() }
+                            .padding(.vertical, 8)
+                    }
+                    .padding(.horizontal, 14).padding(.vertical, 4)
+                    .background(RoundedRectangle(cornerRadius: 14).fill(ContentView.card))
+
+                    Text("切换车辆或改动开关后，会按新的条件重新规划路线。")
+                        .font(.caption2).foregroundColor(ContentView.sub)
+                }
+                .padding(.horizontal, 18).padding(.top, 10)
+            }
+            .background(ContentView.bg.ignoresSafeArea())
+            .navigationTitle("路线选项")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) {
+                    Button { presentationMode.wrappedValue.dismiss() } label: {
+                        Image(systemName: "xmark").font(.system(size: 13, weight: .bold))
+                            .foregroundColor(ContentView.ink)
+                            .frame(width: 30, height: 30)
+                            .background(Circle().fill(ContentView.stroke.opacity(0.6)))
+                    }
+                }
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button { presentationMode.wrappedValue.dismiss() } label: {
+                        Image(systemName: "checkmark").font(.system(size: 14, weight: .bold))
+                            .foregroundColor(ContentView.ink)
+                            .frame(width: 30, height: 30)
+                            .background(Circle().fill(ContentView.stroke.opacity(0.6)))
+                    }
+                }
+            }
+        }
+        // 子 sheet 挂在稳定的 NavigationView 外层，避免 List 重建导致「弹出 1 秒就缩回」
+        .sheet(isPresented: $showPlateSetup) { PlateSetupView() }
+    }
+}
+
 // MARK: - 苹果地图式「路线详情」
 /// 点按已选中的路线卡、或者点按地图上的蓝色路线折线，都会弹出这一页。
 private struct RouteDetailView: View {
     @ObservedObject private var navi = NaviBridge.shared
     @ObservedObject private var settings = Settings.shared
     @Environment(\.presentationMode) private var presentationMode
-    @State private var showPlateSetup = false
-    let destName: String
 
     private var selected: NaviBridge.RouteOption? {
         navi.routeOptions.first { $0.id == navi.selectedRouteID } ?? navi.routeOptions.first
@@ -2537,39 +2665,7 @@ private struct RouteDetailView: View {
                     }
                 }
 
-                Section(header: Text("路线设置"),
-                        footer: Text("路线数据由高德导航 SDK 提供。点按地图上的蓝色路线或已选中的路线卡，可再次打开本页。")) {
-                    HStack { Text("出发地"); Spacer(); Text("我的位置").foregroundColor(ContentView.sub) }
-                    HStack { Text("目的地"); Spacer(); Text(destName.isEmpty ? "—" : destName).foregroundColor(ContentView.sub).lineLimit(1) }
-                    if !navi.vias.isEmpty {
-                        HStack(alignment: .top) {
-                            Text("途经点")
-                            Spacer()
-                            Text(navi.vias.map { $0.name }.joined(separator: " → "))
-                                .foregroundColor(ContentView.sub).lineLimit(2)
-                        }
-                    }
-                    Toggle("不走高速", isOn: $settings.avoidHighway)
-                        .font(.subheadline).foregroundColor(ContentView.ink).tint(ContentView.pink)
-                        .onChange(of: settings.avoidHighway) { _ in navi.replan() }
-                    Toggle("规划路线时避开限行", isOn: $settings.avoidRestriction)
-                        .font(.subheadline).foregroundColor(ContentView.ink).tint(ContentView.pink)
-                        .onChange(of: settings.avoidRestriction) { _ in settings.applyVehicleSettings() }
-                    HStack { Text("车牌"); Spacer(); Text(settings.plateNumber.isEmpty ? "未填写" : settings.plateNumber).foregroundColor(ContentView.sub) }
-                }
-
-                Section(header: Text("限行政策 · 引用与解决办法")) {
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text("引用依据").font(.caption).foregroundColor(ContentView.sub)
-                        Text("高德导航 SDK 本次算路返回的限行结论（AMapNaviRoute.restrictionInfo，titleType = \(navi.restrictionType)）")
-                            .font(.footnote).foregroundColor(ContentView.ink)
-                            .fixedSize(horizontal: false, vertical: true)
-                        Text("限行规则由各地公安机关交通管理部门发布，按车牌尾号、外地号牌、限行时段与区域执行。本页仅引用高德按车牌 \(plateDisplay) 计算的结果，不代表官方认定。")
-                            .font(.footnote).foregroundColor(ContentView.sub)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                    .padding(.vertical, 4)
-
+                Section(header: Text("限行政策 · 避开与改走线路")) {
                     HStack(alignment: .top, spacing: 8) {
                         Image(systemName: navi.restrictionOK ? "checkmark.shield.fill" : "exclamationmark.shield.fill")
                             .foregroundColor(navi.restrictionOK ? .green : .orange)
@@ -2577,26 +2673,39 @@ private struct RouteDetailView: View {
                             .fixedSize(horizontal: false, vertical: true)
                     }
 
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text("解决办法").font(.caption).foregroundColor(ContentView.sub)
-                        ForEach(restrictionAdvice, id: \.self) { a in
-                            HStack(alignment: .top, spacing: 6) {
-                                Image(systemName: "circle.fill").font(.system(size: 5))
-                                    .foregroundColor(ContentView.cyan).padding(.top, 6)
-                                Text(a).font(.footnote).foregroundColor(ContentView.ink)
-                                    .fixedSize(horizontal: false, vertical: true)
-                            }
+                    if navi.roadBrief.hasAlternatives {
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("避开的线路").font(.caption).foregroundColor(ContentView.sub)
+                            Text(roadsLine(navi.roadBrief.avoided,
+                                           fallback: "与其他方案相比，本方案没有额外避开的道路。"))
+                                .font(.footnote).foregroundColor(ContentView.ink)
+                                .fixedSize(horizontal: false, vertical: true)
                         }
-                    }
-                    .padding(.vertical, 4)
+                        .padding(.vertical, 4)
 
-                    Text("以当地公安交管部门最新通告及「交管 12123」为准，出行前请再次核对当日尾号与限行时段。")
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("改走的线路").font(.caption).foregroundColor(ContentView.sub)
+                            Text(roadsLine(navi.roadBrief.used,
+                                           fallback: "本方案与其他方案途经的道路相同。"))
+                                .font(.footnote).foregroundColor(ContentView.ink)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        .padding(.vertical, 4)
+                    } else {
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("本方案途经的主要道路").font(.caption).foregroundColor(ContentView.sub)
+                            Text(roadsLine(navi.roadBrief.mainRoads,
+                                           fallback: "本次算路没有返回可用的道路名称。"))
+                                .font(.footnote).foregroundColor(ContentView.ink)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        .padding(.vertical, 4)
+                        Text("本次只规划出一条路线，没有其他方案可对比出「避开 / 改走」的线路。")
+                            .font(.caption2).foregroundColor(ContentView.sub)
+                    }
+
+                    Text("道路名来自高德导航 SDK 本次算路返回的 AMapNaviLink.roadName，按里程排序取主要道路；「避开 / 改走」是把选中方案与其他备选方案对比得出，只表示路线差异，不代表官方限行认定。")
                         .font(.caption2).foregroundColor(ContentView.sub)
-
-                    Button { showPlateSetup = true } label: {
-                        Label("去设置车牌 / 避开限行", systemImage: "car.fill")
-                            .font(.subheadline).foregroundColor(ContentView.cyan)
-                    }
                 }
             }
             .listStyle(.insetGrouped)
@@ -2609,9 +2718,6 @@ private struct RouteDetailView: View {
                 }
             }
         }
-        // 子 sheet 必须挂在稳定的 NavigationView 上：挂在 List 里的 Section 时，
-        // @ObservedObject 持续刷新会让 Section 重建，系统随即 dismiss 子 sheet（弹出 1 秒就缩回）
-        .sheet(isPresented: $showPlateSetup) { PlateSetupView() }
     }
 
     private func metric(_ icon: String, _ title: String, _ value: String) -> some View {
@@ -2623,46 +2729,9 @@ private struct RouteDetailView: View {
         .frame(maxWidth: .infinity)
     }
 
-    private var plateDisplay: String {
-        settings.plateNumber.isEmpty ? "（未填写）" : settings.plateNumber
-    }
-
-    /// 按高德返回的 titleType 给出针对性处置建议：引用 SDK 结论 + 通用解决办法
-    private var restrictionAdvice: [String] {
-        if !settings.restrictionActive {
-            return ["在「车辆与限行」里填写车牌并开启「规划路线时避开限行」，高德算路才会规避限行区域。",
-                    "未开启时各方案均按不限行计算，请自行核对当日尾号与限行时段。"]
-        }
-        switch navi.restrictionType {
-        case 0:
-            return ["高德提示外地车限行：先补全车牌（含省份简称），再重新规划。",
-                    "若确为外地号牌，可改走绕城 / 高速外围，或把出发时间挪到限行时段之外。"]
-        case 1:
-            return ["当前未开启限行规避：在「车辆与限行」打开「规划路线时避开限行」后重新规划。",
-                    "也可左右滑动切换到其他方案，或错开限行时段出发。"]
-        case 3:
-            return ["起点本身在限行区域内，任何路线都无法规避：把车停在限行区外再设为起点。",
-                    "或改用公交 / 地铁接驳，或按当地规定申请临时通行证。"]
-        case 4:
-            return ["终点在限行区域内，任何路线都无法规避：把目的地改到限行区外的停车场再步行 / 接驳。",
-                    "确认是否为边界误判，可微调目的地坐标后重新规划。"]
-        case 5:
-            return ["某个停靠站落在限行区域内：删除该停靠站，或移到限行区外。",
-                    "限行时段内无法经过时，可调整停靠站顺序或改在非限行时段通过。"]
-        case 6:
-            return ["本方案仍穿过限行区域：左右滑动切换其他方案，或开启「避开限行」后重新规划。",
-                    "也可错开限行时段出发，或改经绕城道路绕行。"]
-        case 8:
-            return ["按预计到达时间限行已结束，本方案可通行。",
-                    "若实际行程延误，仍可能在限行时段内进入，请预留时间余量。"]
-        case 2, 7:
-            return ["高德已按当前车牌避开限行区域，可直接使用本方案。",
-                    "如临时更换车辆，记得在「车辆与限行」切换车牌并重新规划。"]
-        default:
-            return ["本次算路未返回限行结论：该区域可能没有适用于本车牌的规则，或高德未接受车牌。",
-                    "出行前请通过「交管 12123」或当地交警官网核对当日限行规定。",
-                    "若车牌格式有误，在「车辆与限行」修正后重新规划。"]
-        }
+    /// 把道路名拼成一行；没有数据时给一句诚实的说明，不编造线路
+    private func roadsLine(_ roads: [String], fallback: String) -> String {
+        roads.isEmpty ? fallback : roads.joined(separator: "、")
     }
 
     private func eta(_ s: Int) -> String {
