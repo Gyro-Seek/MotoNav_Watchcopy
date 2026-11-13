@@ -300,11 +300,6 @@ final class Settings: ObservableObject {
         } else {
             savedVehicles = []
         }
-        if savedVehicles.isEmpty, !plateNumber.isEmpty {
-            let legacy = Vehicle(name: "我的车", plate: Settings.normalizedPlate(plateNumber), type: vehicleType)
-            savedVehicles = [legacy]
-            activeVehicleID = legacy.id
-        }
         curve = ud.bool(forKey: "map_curve")
         duck = ud.object(forKey: "voice_duck") as? Bool ?? true
         voiceMuted = ud.bool(forKey: "nav_muted")
@@ -312,7 +307,13 @@ final class Settings: ObservableObject {
         mapSource = MapDefaults.source(ud)
         trail = ud.object(forKey: "map_trail") as? Int ?? 1
         clean = ud.bool(forKey: "clean_mode")
-        // 所有存储属性都初始化完以后再调用实例方法
+        // 所有存储属性都初始化完以后，才能访问带 didSet 的 @Published 属性或调用实例方法；
+        // 否则 Swift 会报 'self' used ... before all stored properties are initialized。
+        if savedVehicles.isEmpty, !plateNumber.isEmpty {
+            let legacy = Vehicle(name: "我的车", plate: Settings.normalizedPlate(plateNumber), type: vehicleType)
+            savedVehicles = [legacy]
+            activeVehicleID = legacy.id
+        }
         persistVehicles()
         applyUITheme()
     }
