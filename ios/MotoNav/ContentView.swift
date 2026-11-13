@@ -1713,7 +1713,7 @@ struct HomeMapView: UIViewRepresentable {
     func makeUIView(context: Context) -> MAMapView {
         let map = MAMapView(frame: .zero)
         map.mapType = HomeMapView.mapType(night: night, satellite: satellite)
-        map.showTraffic = traffic                 // 驾车图：实时拥堵路况
+        map.isShowTraffic = traffic               // 驾车图：实时拥堵路况（AMap 属性 getter 为 isShowTraffic）
         map.touchPOIEnabled = true                // 点按地图上的地点 → 底部地点卡
         map.showsCompass = false
         map.showsScale = false
@@ -1735,7 +1735,7 @@ struct HomeMapView: UIViewRepresentable {
     func updateUIView(_ map: MAMapView, context: Context) {
         let type: MAMapType = HomeMapView.mapType(night: night, satellite: satellite)
         if map.mapType != type { map.mapType = type }
-        if map.showTraffic != traffic { map.showTraffic = traffic }
+        if map.isShowTraffic != traffic { map.isShowTraffic = traffic }
         let c = context.coordinator
         c.onRotation = onRotation
         c.onPoiTap = onPoiTap
@@ -1849,10 +1849,12 @@ final class HomeMapDelegate: NSObject {
     deinit { rotationTimer?.invalidate() }
 
     /// 苹果地图式定位点：浅蓝精度圈 + 白边蓝色实心圆点 + 轻微投影
-    private static func userDot(_ m: MAMapView, _ a: MAAnnotation) -> MAAnnotationView {
+    private static func userDot(_ m: MAMapView, _ a: MAAnnotation) -> MAAnnotationView? {
         let id = "appleUserDot"
-        let v = m.dequeueReusableAnnotationView(withIdentifier: id)
-            ?? MAAnnotationView(annotation: a, reuseIdentifier: id)
+        // dequeue 与构造器返回值都是可选的，`??` 的结果仍是 MAAnnotationView?，
+        // 必须先解包；创建失败时返回 nil，由 SDK 回退到默认定位蓝点。
+        guard let v = m.dequeueReusableAnnotationView(withIdentifier: id)
+                ?? MAAnnotationView(annotation: a, reuseIdentifier: id) else { return nil }
         v.annotation = a
         v.frame = CGRect(x: 0, y: 0, width: 26, height: 26)
         v.backgroundColor = UIColor.clear
@@ -1897,7 +1899,7 @@ final class HomeMapDelegate: NSObject {
     @objc(mapView:didTouchPois:)
     func didTouchPois(_ m: MAMapView, pois: NSArray) {
         guard let p = pois.firstObject as? MATouchPoi else { return }
-        let name: String = (p.name as? String) ?? ""
+        let name: String = p.name ?? ""
         guard !name.isEmpty else { return }
         let coord: CLLocationCoordinate2D = p.coordinate
         lastPoiAt = Date()
