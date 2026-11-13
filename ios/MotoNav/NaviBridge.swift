@@ -65,6 +65,38 @@ final class NaviBridge: NSObject, ObservableObject {
     }
     @Published var routeOptions: [RouteOption] = []
     @Published var selectedRouteID = -1
+
+    /// 路况光柱分段：沿当前路线累计米数 [startM, endM)，
+    /// status = 0 未知 / 1 畅通 / 2 缓行 / 3 拥堵 / 4 严重拥堵（与 pushTraffic 的约定一致）
+    struct TrafficSeg {
+        let startM: Int, endM: Int, status: Int
+    }
+    /// 给首页地图用的路况分段：把选中路线折线染成绿 / 黄 / 红 / 深红（苹果地图式）
+    @Published var trafficSegs: [TrafficSeg] = []
+
+    /// 从高德导航 SDK 的路况光柱生成按米数的分段；算路成功、切换方案、导航中回调都会刷新。
+    /// 数据是 SDK 已验证可用的 getTrafficStatuses() / AMapNaviTrafficStatus，未引入新 API。
+    func refreshTrafficSegs(_ input: [AMapNaviTrafficStatus]? = nil) {
+        guard let list = input ?? manager.getTrafficStatuses(), !list.isEmpty else {
+            if !trafficSegs.isEmpty { trafficSegs = [] }
+            return
+        }
+        var segs: [TrafficSeg] = []
+        var pos = 0
+        for o in list {
+            let len = o.length
+            let st = o.status.rawValue
+            if len > 0 {
+                if let last = segs.last, last.status == st, last.endM >= pos - 5 {
+                    segs[segs.count - 1] = TrafficSeg(startM: last.startM, endM: pos + len, status: st)
+                } else {
+                    segs.append(TrafficSeg(startM: pos, endM: pos + len, status: st))
+                }
+            }
+            pos += len
+        }
+        trafficSegs = segs
+    }
     @Published var shareMatch = ""                  // 和分享路线的吻合程度
     @Published private(set) var shareRoute: AmapShare.Route?
     struct Via: Identifiable { let id = UUID(); let name: String; let lat: Double; let lng: Double }
@@ -341,6 +373,7 @@ final class NaviBridge: NSObject, ObservableObject {
         shareRoute = nil; vias = []
         calculating = false; routeReady = false; planFailed = false
         routeOptions = []; selectedRouteID = -1; shareMatch = ""; routeSummary = ""
+        trafficSegs = []
         restrictionType = -1; restrictionTitle = ""
         info = "（还没开始导航）"
     }
@@ -416,6 +449,7 @@ final class NaviBridge: NSObject, ObservableObject {
             MapFeeder.shared.prepareRoute(key: "selected-\(routeID)", coords: o.coords.map { (lat: $0.latitude, lng: $0.longitude) })
         }
         checkShareMatch()
+        refreshTrafficSegs()          // 切换方案后刷新该路线的路况着色
     }
 
     static func distText(_ m: Int) -> String { m >= 1000 ? String(format: "%.1f 公里", Double(m) / 1000) : "\(m) 米" }
@@ -1096,6 +1130,11 @@ extension NaviBridge {
             info += " · " + restrictionSummary
         }
         if let f = opts.first { select(routeID: f.id) }
+        // 算路成功后取一次路况；部分 SDK 版本光柱稍晚才填充，0.6s 后补读一次
+        refreshTrafficSegs()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
+            self?.refreshTrafficSegs()
+        }
     }
 
     @objc(driveManager:onCalculateRouteFailure:)
@@ -1273,5 +1312,6 @@ extension NaviBridge {
     @objc(driveManager:updateTrafficStatus:)
     func mnTraffic(_ m: AMapNaviDriveManager, status: [AMapNaviTrafficStatus]?) {
         if navigating { pushTraffic(status) }
+        refreshTrafficSegs(status)    // 路况光柱同步给首页路线折线着色
     }
 }
