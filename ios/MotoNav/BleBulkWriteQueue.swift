@@ -35,17 +35,6 @@ struct BleBulkWriteQueue {
         parts.removeAll { $0.type == type && $0.id == id }
         // An application K can arrive before the ATT callback; still wait for that callback.
     }
-    /// The device rejected a whole bulk payload (N,type,id). Purge every queued fragment
-    /// of that type so the replacement packet cannot be mixed with stale writes.
-    mutating func clear(type: Int) {
-        parts.removeAll { $0.type == type }
-        acknowledged.removeValue(forKey: type)
-        // -1 makes a late ATT callback resolve to .obsolete instead of re-inserting its
-        // stale fragment at the head of the new packet's queue.
-        // Keep inFlight: replace() does not clear it, so the new packet waits for the
-        // in-flight write to finish. Clearing it here would let both packets interleave.
-        latest[type] = -1
-    }
     mutating func reset() { parts.removeAll(); latest.removeAll(); acknowledged.removeAll(); inFlight = nil }
 }
 
