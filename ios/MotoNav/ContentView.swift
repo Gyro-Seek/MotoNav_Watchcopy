@@ -4,6 +4,7 @@ import AVFoundation
 import Combine
 import ObjectiveC
 import UIKit
+import QuartzCore
 
 /// 版本：跟随 App 版本（见 Config.swift）
 ///
@@ -44,9 +45,6 @@ struct ContentView: View {
     @State private var addingVia = false               // 正在搜途经点
     @State private var viaManager = false              // 途经点管理面板（增删 / 拖动排序）
     @State private var viaEditMode = EditMode.active   // 途经点列表常显拖拽手柄
-    @State private var dragRows: [NaviBridge.Stop]? = nil   // 拖动中的站点顺序（实时重排，松手才 replan）
-    @State private var dragStartIndex: Int? = nil
-    @State private var draggingStopID: String? = nil
     @State private var showRecentAll = false            // 「最近搜索 ›」二级菜单（看全部记录）
     @State private var favEditID: UUID? = nil            // 点「地点」图标：内联展开改备注 / 去这里 / 移除
     @State private var favEditName = ""
@@ -65,7 +63,7 @@ struct ContentView: View {
     @State private var suppressAutoSearch = false      // 程序化改 query 时不触发实时检索
     @State private var searchWork: DispatchWorkItem? = nil
     @State private var keyboardHeight: CGFloat = 0     // 键盘高度：把搜索面板顶到键盘上方
-    @AppStorage("map_layer") private var mapLayer = 0 // 0 探索 / 1 驾车（实时路况） / 2 卫星
+    @AppStorage("map_layer") private var mapLayer = 0 // 0 探索 / 1 驾车（实时路况） / 2 卫星 / 3 地铁
     @State private var mapRotated = false              // 地图被手动旋转、不是北向上
     @State private var northToken = 0                  // 左下角「回正」按钮
     @State private var poiSelected = false             // 地点来自点按地图（点空白处可收起）
@@ -632,10 +630,13 @@ struct ContentView: View {
         .buttonStyle(.plain)
     }
 
-    /// 停靠站统一列表：起点 / 途经点 / 终点全部可拖动换序；删除按钮不再常显，改为左滑出现。
-    /// 用系统 List + swipeActions（左滑删除）+ 手柄 DragGesture（拖动中实时重排，交互跟手）。
+    /// 停靠站统一列表：起点 / 途经点 / 终点全部可拖动换序；删除按钮改为左滑出现。
+    /// 苹果地图式交互：改用系统 List 的 ForEach.onMove 原生拖动（iOS 16+ 长按整行即可，
+    /// 不必进入 editMode，swipeActions 左滑删除可共存）。由 UIKit 负责行跟随手指、自动让位
+    /// 与插入动画；拖动全程不触发 SwiftUI 重排、不触发算路，松手落位后仅回调一次，一次性
+    /// 写回并 replan。彻底消除旧版自定义 DragGesture 的抖动、抢手势与「反复正在规划路线…」。
     private var routeStopsCard: some View {
-        let stops = dragRows ?? routeStops
+        let stops = routeStops
         let rowH: CGFloat = 52
         return VStack(spacing: 0) {
             List {
@@ -650,6 +651,15 @@ struct ContentView: View {
                                 Label("删除", systemImage: "trash")
                             }
                         }
+                }
+                .onMove { src, dst in
+                    // 系统原生拖动：松手落位才回调一次，这里一次性写回 + replan
+                    guard navi.shareRoute == nil, let from = src.first else { return }
+                    var rows = stops
+                    let moved = rows.remove(at: from)
+                    let to = dst > from ? dst - 1 : dst
+                    rows.insert(moved, at: min(max(to, 0), rows.count))
+                    commitStops(rows)
                 }
             }
             .listStyle(.plain)
@@ -673,7 +683,7 @@ struct ContentView: View {
         .overlay(RoundedRectangle(cornerRadius: 16).stroke(ContentView.stroke, lineWidth: 1))
     }
 
-    /// 由 NaviBridge 的真实状态派生站点数组；拖动时用 dragRows 覆盖，松手后一次性写回。
+    /// 由 NaviBridge 的真实状态派生站点数组；系统 onMove 落位后一次性写回并重算。
     private var routeStops: [NaviBridge.Stop] {
         var a: [NaviBridge.Stop] = []
         let me = navi.myPosition()
@@ -705,42 +715,14 @@ struct ContentView: View {
             Text(s.name).font(.subheadline).foregroundColor(ContentView.ink).lineLimit(1)
             Spacer(minLength: 4)
             Text(tag).font(.caption2).foregroundColor(ContentView.sub)
-            // 右侧拖动把手：整条把手区域接管纵向拖动，拖动中实时把这一行插到目标位置
+            // 右侧三横线只作「可长按拖动」的视觉提示；真正拖动由系统 List.onMove 接管，
+            // 长按本行任意位置即可，不再叠加自定义 DragGesture（避免抢手势 / 抖动 / 反复算路）
             Image(systemName: "line.horizontal.3").font(.caption)
                 .foregroundColor(ContentView.sub)
                 .frame(width: 34, height: 44)
                 .contentShape(Rectangle())
-                .highPriorityGesture(stopDragGesture(s))
         }
         .frame(height: 52)
-        .background(draggingStopID == s.id ? ContentView.cyan.opacity(0.12) : Color.clear)
-        .cornerRadius(8)
-    }
-
-    private func stopDragGesture(_ s: NaviBridge.Stop) -> some Gesture {
-        DragGesture(minimumDistance: 5)
-            .onChanged { g in
-                guard navi.shareRoute == nil else { return }
-                if dragRows == nil {
-                    let base = routeStops
-                    dragRows = base
-                    dragStartIndex = base.firstIndex(where: { $0.id == s.id }) ?? 0
-                    draggingStopID = s.id
-                }
-                guard var rows = dragRows, let start = dragStartIndex,
-                      let cur = rows.firstIndex(where: { $0.id == draggingStopID }) else { return }
-                let target = min(max(start + Int((g.translation.height / 52).rounded()), 0), rows.count - 1)
-                guard cur != target else { return }
-                withAnimation(.easeInOut(duration: 0.12)) {
-                    let item = rows.remove(at: cur)
-                    rows.insert(item, at: target)
-                    dragRows = rows
-                }
-            }
-            .onEnded { _ in
-                if let rows = dragRows { commitStops(rows) }
-                dragRows = nil; dragStartIndex = nil; draggingStopID = nil
-            }
     }
 
     /// 拖动 / 删除落定：第一个站点是新起点、最后一个是新终点、中间是途经点。
@@ -755,7 +737,7 @@ struct ContentView: View {
 
     private func deleteStop(_ s: NaviBridge.Stop) {
         guard navi.shareRoute == nil else { return }
-        var rows = dragRows ?? routeStops
+        var rows = routeStops
         guard rows.count > 2 else { return }         // 至少保留起点 + 终点
         rows.removeAll { $0.id == s.id }
         guard rows.count >= 2 else { return }
@@ -1200,6 +1182,7 @@ struct ContentView: View {
                     HomeMapView(
                         night: mapNight,
                         satellite: mapSatellite,
+                        bus: mapBus,
                         traffic: mapTraffic,
                         focus: homeFocus,
                         focusToken: focusToken,
@@ -1257,7 +1240,7 @@ struct ContentView: View {
         }
     }
 
-    /// 右上角地图按钮：三选一「探索 / 驾车 / 卫星」（从上往下）。
+    /// 右上角地图按钮：四选一「探索 / 驾车 / 地铁 / 卫星」（从上往下）。
     /// 界面深浅、标准 / 夜间地图配色统一放到设置里，默认自动跟随日出日落。
     private var mapControls: some View {
         Menu {
@@ -1267,11 +1250,14 @@ struct ContentView: View {
             Button { mapLayer = 1 } label: {
                 Label("驾车", systemImage: mapLayer == 1 ? "checkmark" : "car.fill")
             }
+            Button { mapLayer = 3 } label: {
+                Label("地铁", systemImage: mapLayer == 3 ? "checkmark" : "tram.fill")
+            }
             Button { mapLayer = 2 } label: {
                 Label("卫星", systemImage: mapLayer == 2 ? "checkmark" : "globe")
             }
         } label: {
-            MapGlassButton(icon: mapLayer == 1 ? "car.fill" : (mapLayer == 2 ? "globe" : "map"),
+            MapGlassButton(icon: mapLayer == 1 ? "car.fill" : (mapLayer == 3 ? "tram.fill" : (mapLayer == 2 ? "globe" : "map")),
                            active: mapLayer != 0)
         }
     }
@@ -1285,6 +1271,7 @@ struct ContentView: View {
         }
     }
     private var mapSatellite: Bool { mapLayer == 2 }
+    private var mapBus: Bool { mapLayer == 3 }         // 地铁：高德 MAMapTypeBus 公交 / 地铁视图
     private var mapTraffic: Bool { mapLayer == 1 }
 
     /// 右下角：回到我的定位位置（苹果地图式玻璃圆钮）
@@ -2109,6 +2096,7 @@ private enum SettingsPage: String, CaseIterable, Identifiable {
 struct HomeMapView: UIViewRepresentable {
     let night: Bool
     var satellite = false
+    var bus = false                     // 地铁：高德公交视图 MAMapTypeBus
     var traffic = false
     var focus: CLLocationCoordinate2D? = nil
     var focusToken = 0
@@ -2133,8 +2121,9 @@ struct HomeMapView: UIViewRepresentable {
         return String(format: "%.6f,%.6f", c.latitude, c.longitude)
     }
 
-    private static func mapType(night: Bool, satellite: Bool) -> MAMapType {
+    private static func mapType(night: Bool, satellite: Bool, bus: Bool) -> MAMapType {
         if satellite { return .satellite }
+        if bus { return .bus }           // 地铁：高德官方「公交视图」MAMapTypeBus
         return night ? .standardNight : .standard
     }
 
@@ -2142,7 +2131,7 @@ struct HomeMapView: UIViewRepresentable {
 
     func makeUIView(context: Context) -> MAMapView {
         let map = MAMapView(frame: .zero)
-        map.mapType = HomeMapView.mapType(night: night, satellite: satellite)
+        map.mapType = HomeMapView.mapType(night: night, satellite: satellite, bus: bus)
         map.isShowTraffic = traffic               // 驾车图：实时拥堵路况（AMap 属性 getter 为 isShowTraffic）
         map.touchPOIEnabled = true                // 点按地图上的地点 → 底部地点卡
         map.showsCompass = false
@@ -2155,6 +2144,7 @@ struct HomeMapView: UIViewRepresentable {
         map.userTrackingMode = .follow
         map.delegate = context.coordinator.asDelegate
         let c = context.coordinator
+        c.startHeading()                 // 蓝点方向光柱：开始接收设备真北朝向
         c.onRotation = onRotation
         c.onPoiTap = onPoiTap
         c.onBlankTap = onBlankTap
@@ -2173,7 +2163,7 @@ struct HomeMapView: UIViewRepresentable {
     }
 
     func updateUIView(_ map: MAMapView, context: Context) {
-        let type: MAMapType = HomeMapView.mapType(night: night, satellite: satellite)
+        let type: MAMapType = HomeMapView.mapType(night: night, satellite: satellite, bus: bus)
         if map.mapType != type { map.mapType = type }
         if map.isShowTraffic != traffic { map.isShowTraffic = traffic }
         let c = context.coordinator
@@ -2203,7 +2193,7 @@ struct HomeMapView: UIViewRepresentable {
         let tfKey: String = trafficSegs.map { (s: NaviBridge.TrafficSeg) -> String in
             "\(s.startM)-\(s.endM)-\(s.status)"
         }.joined(separator: ",")
-        let key: String = routeKey + head + destKey + "|" + viaKey + "|" + focusKey + "|f" + String(focusToken) + "|t" + tfKey
+        let key: String = routeKey + head + destKey + "|" + viaKey + "|" + focusKey + "|f" + String(focusToken) + "|t" + tfKey + "|b" + String(bus)
         if c.key != key {
             c.key = key
             if let old = map.overlays { map.removeOverlays(old) }
@@ -2288,7 +2278,26 @@ struct HomeMapView: UIViewRepresentable {
 /// 地图回调：选中路线主色粗线、备选灰色、分享原路线橙色虚线；目的地红针、途经点紫针。
 /// 当前位置用苹果式蓝色圆点（白边 + 浅蓝精度圈），不再用高德默认的大头针。
 /// 与工程里的 RouteMapDelegate 同样用运行时登记协议，避开 Swift / 高德 SDK 方法名冲突。
-final class HomeMapDelegate: NSObject, UIGestureRecognizerDelegate {
+final class HomeMapDelegate: NSObject, UIGestureRecognizerDelegate, CLLocationManagerDelegate {
+    /// 蓝点方向光柱：独立监听设备真北朝向（CLHeading），不依赖 SDK 的 userTrackingMode，
+    /// 也不需要把地图切成「跟随方向旋转」。无有效朝向（模拟器 / 未授权）时光柱自动隐藏。
+    private let headingManager = CLLocationManager()
+    var lastHeading: CLLocationDirection = -1
+    var lastBeamDeg: Double = -999           // 光柱累积角度（跨 0/360 时走最短路径，不绕圈）
+    weak var userDotView: MAAnnotationView?
+
+    func startHeading() {
+        guard CLLocationManager.headingAvailable() else { return }
+        headingManager.delegate = self
+        headingManager.headingFilter = 2
+        headingManager.startUpdatingHeading()
+    }
+
+    func locationManager(_ manager: CLLocationManager, didUpdateHeading newHeading: CLHeading) {
+        let h = newHeading.trueHeading >= 0 ? newHeading.trueHeading : newHeading.magneticHeading
+        lastHeading = h
+    }
+
     var key = ""
     var focusSeq = -1
     var recenterSeq = -1
@@ -2343,12 +2352,41 @@ final class HomeMapDelegate: NSObject, UIGestureRecognizerDelegate {
                 s.rotated = now
                 DispatchQueue.main.async { s.onRotation?(now) }
             }
+            // 苹果地图式方向光柱：地理朝向减去地图旋转角 = 屏幕上的指向。
+            // 与 rotationDegree 共用 0.25s 轮询；按最短路径累积角度，跨 0/360 不绕圈。
+            if let beam = s.userDotView?.viewWithTag(8803) {
+                if s.lastHeading >= 0 {
+                    let deg = s.lastHeading - Double(m.rotationDegree)
+                    var target = deg
+                    if s.lastBeamDeg > -900 {
+                        var delta = deg - s.lastBeamDeg
+                        delta = delta.truncatingRemainder(dividingBy: 360)
+                        if delta > 180 { delta -= 360 }
+                        if delta < -180 { delta += 360 }
+                        target = s.lastBeamDeg + delta
+                    }
+                    if abs(target - s.lastBeamDeg) > 0.4 || beam.alpha == 0 {
+                        s.lastBeamDeg = target
+                        let rad = CGFloat(target * .pi / 180)
+                        UIView.animate(withDuration: 0.22, delay: 0,
+                                       options: [.beginFromCurrentState, .allowUserInteraction]) {
+                            beam.alpha = 1
+                            beam.transform = CGAffineTransform(rotationAngle: rad)
+                        }
+                    }
+                } else if beam.alpha != 0 {
+                    beam.alpha = 0
+                }
+            }
         }
         RunLoop.main.add(t, forMode: .common)
         rotationTimer = t
     }
 
-    deinit { rotationTimer?.invalidate() }
+    deinit {
+        rotationTimer?.invalidate()
+        headingManager.stopUpdatingHeading()
+    }
 
     /// 苹果地图式定位点：浅蓝精度圈 + 白边蓝色实心圆点 + 轻微投影
     private static func userDot(_ m: MAMapView, _ a: MAAnnotation) -> MAAnnotationView? {
@@ -2360,7 +2398,39 @@ final class HomeMapDelegate: NSObject, UIGestureRecognizerDelegate {
         v.annotation = a
         v.frame = CGRect(x: 0, y: 0, width: 26, height: 26)
         v.backgroundColor = UIColor.clear
+        v.clipsToBounds = false         // 方向光柱比蓝点大，不能被裁掉
         v.centerOffset = CGPoint(x: 0, y: 0)
+        // 苹果地图式方向光柱：朝正北的半透明蓝色扇形，由中心向外渐隐；
+        // 由 watchRotation 轮询按「设备朝向 − 地图旋转角」旋转，拿不到朝向时隐藏。
+        if v.viewWithTag(8803) == nil {
+            let beam = UIView(frame: CGRect(x: -47, y: -47, width: 120, height: 120))
+            beam.tag = 8803
+            beam.isUserInteractionEnabled = false
+            beam.backgroundColor = UIColor.clear
+            let center = CGPoint(x: 60, y: 60)
+            let r: CGFloat = 54
+            let a0 = CGFloat(-90 - 32) * .pi / 180
+            let a1 = CGFloat(-90 + 32) * .pi / 180
+            let path = UIBezierPath()
+            path.move(to: center)
+            path.addArc(withCenter: center, radius: r, startAngle: a0, endAngle: a1, clockwise: true)
+            path.close()
+            let mask = CAShapeLayer()
+            mask.frame = beam.bounds          // mask 必须有 frame，否则渐变不显示
+            mask.path = path.cgPath
+            mask.fillColor = UIColor.white.cgColor
+            let grad = CAGradientLayer()
+            grad.frame = beam.bounds
+            grad.colors = [UIColor.systemBlue.withAlphaComponent(0.0).cgColor,
+                           UIColor.systemBlue.withAlphaComponent(0.42).cgColor]
+            grad.locations = [NSNumber(value: 0.0), NSNumber(value: 1.0)]
+            grad.startPoint = CGPoint(x: 0.5, y: 0.0)
+            grad.endPoint = CGPoint(x: 0.5, y: 0.5)
+            grad.mask = mask
+            beam.layer.addSublayer(grad)
+            beam.alpha = 0
+            v.insertSubview(beam, at: 0)
+        }
         if v.viewWithTag(8801) == nil {
             let ring = UIView(frame: CGRect(x: 0, y: 0, width: 26, height: 26))
             ring.backgroundColor = UIColor.systemBlue.withAlphaComponent(0.14)
@@ -2385,7 +2455,9 @@ final class HomeMapDelegate: NSObject, UIGestureRecognizerDelegate {
     @objc(mapView:viewForAnnotation:)
     func annotationView(_ m: MAMapView, annotation: MAAnnotation) -> MAAnnotationView? {
         if annotation is MAUserLocation {
-            return HomeMapDelegate.userDot(m, annotation)
+            let dot = HomeMapDelegate.userDot(m, annotation)
+            self.userDotView = dot           // 交给 watchRotation 旋转方向光柱
+            return dot
         }
         guard let a = annotation as? MAPointAnnotation else { return nil }
         let id = "homePin"
