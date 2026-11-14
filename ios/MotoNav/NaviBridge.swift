@@ -430,8 +430,14 @@ final class NaviBridge: NSObject, ObservableObject {
         customStart = first.myLocation ? nil
             : Stop(id: "start", name: first.name, lat: first.lat, lng: first.lng, myLocation: false)
         destLat = last.lat; destLng = last.lng
-        vias = ordered[1..<(ordered.count - 1)].map {
-            Via(name: $0.name, lat: $0.lat, lng: $0.lng)
+        // 复用已有 Via（按坐标匹配），保持 id 稳定：拖动落位后 ForEach 不会因为
+        // 全量新建 UUID 而重建整张列表，行不塌陷、不弹回。
+        let previous = vias
+        vias = ordered[1..<(ordered.count - 1)].map { s in
+            if let hit = previous.first(where: { abs($0.lat - s.lat) < 0.000001 && abs($0.lng - s.lng) < 0.000001 }) {
+                return hit
+            }
+            return Via(name: s.name, lat: s.lat, lng: s.lng)
         }
         replan()
     }

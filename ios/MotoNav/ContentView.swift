@@ -46,8 +46,12 @@ struct ContentView: View {
     @State private var viaManager = false              // 途经点管理面板（增删 / 拖动排序）
     @State private var viaEditMode = EditMode.active   // 途经点列表常显拖拽手柄
     @State private var showRecentAll = false            // 「最近搜索 ›」二级菜单（看全部记录）
-    @State private var favEditID: UUID? = nil            // 点「地点」图标：内联展开改备注 / 去这里 / 移除
+    @State private var favEditID: UUID? = nil            // 仅设置中心「地点」页：改备注 / 去这里 / 移除
     @State private var favEditName = ""
+    @State private var stopRows: [NaviBridge.Stop] = []  // 停靠站列表的稳定数据源：拖动时同 id 重排，不整表重建
+    @State private var stopReplanWork: DispatchWorkItem? = nil  // 连续拖动去抖：最后一次松手稳定后才算路
+    @State private var drawerDragY: CGFloat = 0         // 抽屉跟手拖动偏移，地图可见区实时跟随
+    @State private var showMapMenu = false              // 右上角地图模式菜单（自定义窄浮层）
     @Environment(\.scenePhase) private var scenePhase
     @State private var lastHandledShare = ""        // 去重：onOpenURL 和前台自动消费可能同时到
     @State private var sheetExpanded = false         // 首页底部搜索抽屉：上滑展开更多入口
@@ -118,7 +122,15 @@ struct ContentView: View {
         .sheet(isPresented: $showRouteOptions) { RouteOptionsView() }
         .sheet(isPresented: $showRecentAll) { recentAllSheet }
         // 换了阶段（搜索 / 地点 / 路线）就自动恢复抽屉，避免停在「缩到最小」的状态
-        .onChange(of: homeStage) { _ in drawerMinimized = false }
+        .onChange(of: homeStage) { st in
+            drawerMinimized = false
+            showMapMenu = false
+            if st == .routes {
+                stopRows = routeStops          // 进入路线面板：用真实状态建一次稳定快照
+            } else {
+                stopReplanWork?.cancel(); stopReplanWork = nil
+            }
+        }
         .onAppear {                                    // iOS v0.7 打开 App 时，高德 key 没填就提醒一次
             if !ContentView.keyPrompted && settings.keysMissing {
                 ContentView.keyPrompted = true
@@ -636,7 +648,7 @@ struct ContentView: View {
     /// 与插入动画；拖动全程不触发 SwiftUI 重排、不触发算路，松手落位后仅回调一次，一次性
     /// 写回并 replan。彻底消除旧版自定义 DragGesture 的抖动、抢手势与「反复正在规划路线…」。
     private var routeStopsCard: some View {
-        let stops = routeStops
+        let stops = stopRows.isEmpty ? routeStops : stopRows
         let rowH: CGFloat = 52
         return VStack(spacing: 0) {
             List {
@@ -653,18 +665,23 @@ struct ContentView: View {
                         }
                 }
                 .onMove { src, dst in
-                    // 系统原生拖动：松手落位才回调一次，这里一次性写回 + replan
+                    // 系统原生拖动：松手落位才回调一次。
+                    // 关键：先原地更新稳定数据源（同 id 重排），行立刻落在目标位、不弹回也不整表重建；
+                    // 再去抖写回 NaviBridge + 算路，连续拖动只在最后一次松手后算一次，
+                    // 避免每次落位都清空 routeOptions、弹「正在规划路线…」把抽屉顶得上下跳。
                     guard navi.shareRoute == nil, let from = src.first else { return }
                     var rows = stops
                     let moved = rows.remove(at: from)
                     let to = dst > from ? dst - 1 : dst
                     rows.insert(moved, at: min(max(to, 0), rows.count))
-                    commitStops(rows)
+                    stopRows = rows
+                    scheduleStopReplan(rows)
                 }
             }
             .listStyle(.plain)
             .background(ContentView.card)
             .frame(height: max(CGFloat(stops.count) * rowH, rowH))
+            .onAppear { if stopRows.isEmpty { stopRows = routeStops } }
             Button { openViaSearch() } label: {
                 HStack(spacing: 10) {
                     Image(systemName: "plus.circle.fill").font(.system(size: 20))
@@ -735,13 +752,27 @@ struct ContentView: View {
         overviewToken += 1
     }
 
+    /// 拖动落位后延迟 0.45s 再写回算路：连续拖动只算最后一次。
+    /// 期间列表用 stopRows 稳定显示，路线面板保持固定高度，不再反复弹「正在规划路线…」。
+    private func scheduleStopReplan(_ rows: [NaviBridge.Stop]) {
+        stopReplanWork?.cancel()
+        let work = DispatchWorkItem {
+            self.stopReplanWork = nil
+            guard self.navi.shareRoute == nil else { return }
+            self.commitStops(rows)
+        }
+        stopReplanWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.45, execute: work)
+    }
+
     private func deleteStop(_ s: NaviBridge.Stop) {
         guard navi.shareRoute == nil else { return }
-        var rows = routeStops
+        var rows = stopRows.isEmpty ? routeStops : stopRows
         guard rows.count > 2 else { return }         // 至少保留起点 + 终点
         rows.removeAll { $0.id == s.id }
         guard rows.count >= 2 else { return }
-        commitStops(rows)
+        stopRows = rows
+        commitStops(rows)                            // 删除是明确操作，立即写回，不需要去抖
     }
 
     /// 固定在抽屉底部的路线分页卡片：左右滑动切换方案（苹果地图式分页圆点）
@@ -755,6 +786,8 @@ struct ContentView: View {
                     Spacer(minLength: 4)
                 }
                 .padding(14)
+                // 与分页卡同为 116 高：算路期间 routeOptions 被清空也不会把抽屉顶得上下跳
+                .frame(height: 116, alignment: .top)
                 .background(RoundedRectangle(cornerRadius: 18).fill(ContentView.card))
             } else {
                 TabView(selection: Binding(
@@ -1007,6 +1040,7 @@ struct ContentView: View {
             History.shared.add(p)
             viaManager = false         // 加完直接回路线面板：停靠站卡片里立刻看到新点
             homeStage = .routes
+            stopRows = routeStops      // 新增途经点后同步稳定快照（同阶段内 onChange 不会触发）
             overviewToken += 1
             return
         }
@@ -1195,7 +1229,7 @@ struct ContentView: View {
                         trafficSegs: (homeStage == .routes || addingVia) ? navi.trafficSegs : [],
                         dest: (homeStage == .routes || addingVia) ? navi.destCoord : nil,
                         vias: viaCoords,
-                        bottomInset: panelHeight(geo) + keyboardHeight,
+                        bottomInset: max(0, panelHeight(geo) + keyboardHeight - drawerDragY),
                         onRotation: { rotated in mapRotated = rotated },
                         onPoiTap: { name, coord in selectMapPoi(name: name, coord: coord) },
                         onBlankTap: { if poiSelected && homeStage == .place { resetHome() } },
@@ -1209,6 +1243,14 @@ struct ContentView: View {
                         Color.clear
                             .contentShape(Rectangle())
                             .onTapGesture { hideKeyboard() }
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    }
+
+                    // 地图模式菜单展开时：点其它地方收起（覆盖层在菜单之下、地图之上）
+                    if showMapMenu {
+                        Color.clear
+                            .contentShape(Rectangle())
+                            .onTapGesture { withAnimation(.easeOut(duration: 0.15)) { showMapMenu = false } }
                             .frame(maxWidth: .infinity, maxHeight: .infinity)
                     }
 
@@ -1235,31 +1277,58 @@ struct ContentView: View {
                 }
                 homeDrawer(height: panelHeight(geo), bottomSafe: geo.safeAreaInsets.bottom)
                     .ignoresSafeArea(edges: .bottom)
-                    .offset(y: geo.safeAreaInsets.bottom)
+                    .offset(y: geo.safeAreaInsets.bottom + drawerDragY)
             }
         }
     }
 
     /// 右上角地图按钮：四选一「探索 / 驾车 / 地铁 / 卫星」（从上往下）。
+    /// 不用系统 Menu —— 它展开后会自动撑得很宽；改成固定 132pt 的窄浮层，宽度完全可控。
     /// 界面深浅、标准 / 夜间地图配色统一放到设置里，默认自动跟随日出日落。
     private var mapControls: some View {
-        Menu {
-            Button { mapLayer = 0 } label: {
-                Label("探索", systemImage: mapLayer == 0 ? "checkmark" : "map")
+        ZStack(alignment: .topTrailing) {
+            Button {
+                withAnimation(.easeOut(duration: 0.16)) { showMapMenu.toggle() }
+            } label: {
+                MapGlassButton(icon: mapLayer == 1 ? "car.fill" : (mapLayer == 3 ? "tram.fill" : (mapLayer == 2 ? "globe" : "map")),
+                               active: mapLayer != 0)
             }
-            Button { mapLayer = 1 } label: {
-                Label("驾车", systemImage: mapLayer == 1 ? "checkmark" : "car.fill")
+            if showMapMenu {
+                VStack(spacing: 0) {
+                    mapMenuItem(0, "探索", "map")
+                    Divider().background(ContentView.stroke)
+                    mapMenuItem(1, "驾车", "car.fill")
+                    Divider().background(ContentView.stroke)
+                    mapMenuItem(3, "地铁", "tram.fill")
+                    Divider().background(ContentView.stroke)
+                    mapMenuItem(2, "卫星", "globe")
+                }
+                .frame(width: 132)
+                .background(RoundedRectangle(cornerRadius: 12).fill(.ultraThinMaterial))
+                .overlay(RoundedRectangle(cornerRadius: 12).stroke(ContentView.stroke, lineWidth: 1))
+                .shadow(color: Color.black.opacity(0.12), radius: 8, x: 0, y: 4)
+                .padding(.top, 52)
+                .transition(.opacity.combined(with: .scale(scale: 0.92, anchor: .topTrailing)))
             }
-            Button { mapLayer = 3 } label: {
-                Label("地铁", systemImage: mapLayer == 3 ? "checkmark" : "tram.fill")
-            }
-            Button { mapLayer = 2 } label: {
-                Label("卫星", systemImage: mapLayer == 2 ? "checkmark" : "globe")
-            }
-        } label: {
-            MapGlassButton(icon: mapLayer == 1 ? "car.fill" : (mapLayer == 3 ? "tram.fill" : (mapLayer == 2 ? "globe" : "map")),
-                           active: mapLayer != 0)
         }
+    }
+
+    private func mapMenuItem(_ layer: Int, _ title: String, _ icon: String) -> some View {
+        Button {
+            withAnimation(.easeOut(duration: 0.16)) { mapLayer = layer; showMapMenu = false }
+        } label: {
+            HStack(spacing: 8) {
+                Image(systemName: mapLayer == layer ? "checkmark" : icon)
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundColor(mapLayer == layer ? ContentView.cyan : ContentView.ink)
+                    .frame(width: 18)
+                Text(title).font(.subheadline).foregroundColor(ContentView.ink)
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 12).padding(.vertical, 9)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
     }
 
     /// 地图配色：0 自动（日出日落）/ 1 标准 / 2 夜间
@@ -1317,11 +1386,18 @@ struct ContentView: View {
                     homeSearchBar.padding(.horizontal, 14).padding(.bottom, 10)
                 }
             }
-            // 手势只加在「抓手 + 搜索框」区域：上滑展开，下拉逐级收起直到只剩搜索条
-            .gesture(DragGesture(minimumDistance: 24).onEnded { v in
-                if v.translation.height < -45 { expandDrawer() }
-                else if v.translation.height > 45 { collapseDrawer() }
-            })
+            // 手势只加在「抓手 + 搜索框」区域：拖动中抽屉跟手，地图可见区同步收放；
+            // 松手再决定展开 / 收起，避免原来「拖完全程才有反应」的迟滞感。
+            .gesture(DragGesture(minimumDistance: 18)
+                .onChanged { v in
+                    drawerDragY = max(-70, min(140, v.translation.height))
+                }
+                .onEnded { v in
+                    let t = v.translation.height
+                    withAnimation(.spring(response: 0.34, dampingFraction: 0.86)) { drawerDragY = 0 }
+                    if t < -45 { expandDrawer() }
+                    else if t > 45 { collapseDrawer() }
+                })
 
             if showList {
                 ScrollView {
@@ -1338,7 +1414,7 @@ struct ContentView: View {
                             }
                             // 「快捷功能」板块已整体移除：巡航 / 独立路线 / 骑行轨迹 /
                             // 车辆与限行 / 全部设置都收进搜索条右侧的齿轮设置中心
-                            if homeStage == .idle && sheetExpanded { favoritesCard }
+                            if homeStage == .idle && sheetExpanded { favoritesCard() }
                             if homeStage == .idle && (addingVia || sheetExpanded) { recentSection }
                             if !shareStatus.isEmpty && homeStage != .idle {
                                 Text(shareStatus).font(.caption2).foregroundColor(ContentView.sub)
@@ -1567,7 +1643,7 @@ struct ContentView: View {
                 case .debug:
                     debugCard
                 case .favorites:
-                    favoritesCard
+                    favoritesCard(editable: true)      // 设置中心保留改备注 / 去这里 / 移除
                 case .routeModes:
                     independentRouteCard
                 case .about:
@@ -1760,8 +1836,10 @@ struct ContentView: View {
             Toggle("弯道急缓上色", isOn: $settings.curve).foregroundColor(ContentView.ink).tint(ContentView.pink)
         }
     }
-    /// 地点（苹果地图式）：一排横向滚动的彩色圆形图标，点按进入改备注 / 去这里 / 移除。
-    private var favoritesCard: some View {
+    /// 地点（苹果地图式）：一排横向滚动的彩色圆形图标。
+    /// 首页抽屉里点按 = 直接跳到「搜索到该地址」的地点界面（与点搜索结果一致），这里不做任何设置；
+    /// 设置中心「地点」页仍保留改备注 / 去这里 / 移除（editable = true）。
+    private func favoritesCard(editable: Bool = false) -> some View {
         VStack(alignment: .leading, spacing: 10) {
             Text("地点").font(.headline).foregroundColor(ContentView.ink)
             if favorites.places.isEmpty {
@@ -1770,33 +1848,34 @@ struct ContentView: View {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(alignment: .top, spacing: 20) {
                         ForEach(favorites.places.indices, id: \.self) { i in
-                            placeBubble(i: i, place: favorites.places[i])
+                            placeBubble(i: i, place: favorites.places[i], editable: editable)
                         }
                     }
                     .padding(.trailing, 8)
                 }
             }
-            // 点图标后内联展开编辑条（不用 sheet：设置中心页也是本视图，避免 sheet 套 sheet 被系统收起）
-            if favEditID != nil { favEditBar }
+            if editable && !favorites.places.isEmpty {
+                Text("点按地点可改备注 / 去这里 / 移除").font(.caption2).foregroundColor(ContentView.sub)
+            }
+            // 编辑条只在设置中心的「地点」页出现；首页抽屉点图标直接跳地点界面
+            if editable && favEditID != nil { favEditBar }
         }
     }
 
-    private func placeBubble(i: Int, place: Favorites.Place) -> some View {
+    private func placeBubble(i: Int, place: Favorites.Place, editable: Bool) -> some View {
         Button {
-            favEditID = place.id
-            favEditName = place.name
+            if editable {
+                favEditID = place.id
+                favEditName = place.name
+            } else {
+                choose(place.searchPlace)     // 跳到搜索到该地址的地点界面
+            }
         } label: {
             VStack(spacing: 6) {
-                ZStack(alignment: .topTrailing) {
-                    Circle().fill(placeTint(i)).frame(width: 62, height: 62)
-                        .overlay(Image(systemName: placeGlyph(i))
-                            .font(.system(size: 25, weight: .semibold)).foregroundColor(.white))
-                    // 苹果地图式右上角「…」编辑入口
-                    Image(systemName: "ellipsis.circle.fill")
-                        .font(.system(size: 15)).foregroundColor(ContentView.sub)
-                        .background(Circle().fill(ContentView.card))
-                        .offset(x: 7, y: -3)
-                }
+                // 右上角「…」角标已去掉：圆形图标就是纯入口，不再有编辑暗示
+                Circle().fill(placeTint(i)).frame(width: 62, height: 62)
+                    .overlay(Image(systemName: placeGlyph(i))
+                        .font(.system(size: 25, weight: .semibold)).foregroundColor(.white))
                 Text(place.name).font(.caption).foregroundColor(ContentView.ink).lineLimit(1)
                 if let d = distanceTo(place.searchPlace) {
                     Text(d).font(.caption2).foregroundColor(ContentView.sub)
@@ -2150,6 +2229,12 @@ struct HomeMapView: UIViewRepresentable {
         c.onBlankTap = onBlankTap
         c.onRouteTap = onRouteTap
         c.watchRotation(map)
+        // 记录「用户是否手动滑过地图」：滑过之后抽屉高度变化不再调整可见区中心
+        let pan = UIPanGestureRecognizer(target: c, action: #selector(HomeMapDelegate.userDidPanMap(_:)))
+        pan.delegate = c
+        pan.cancelsTouchesInView = false
+        pan.maximumNumberOfTouches = 1
+        map.addGestureRecognizer(pan)
         // 苹果地图式「双击后按住上滑放大 / 下滑缩小」；不干扰 SDK 自带的单击、拖动与捏合
         let zd = ZoomDragRecognizer()
         zd.map = map
@@ -2173,6 +2258,16 @@ struct HomeMapView: UIViewRepresentable {
         c.onRouteTap = onRouteTap
         c.selectedCoords = routes.first(where: { $0.id == selectedRouteID })?.coords ?? []
         c.watchRotation(map)
+
+        // 抽屉上下拖动时，可见地图区域跟着变：把跟随定位的蓝点放在「未被抽屉遮挡区域」的中心。
+        // 可见区中心相对整屏的比例 = 0.5 - bottomInset / (2 * 屏高)，用高德 screenAnchor 表达。
+        // 只在「正在跟随定位」且用户没手动滑过地图时生效；否则完全不干预，避免地图跳动。
+        if map.userTrackingMode == .follow && !c.userPannedMap {
+            let h = max(map.bounds.height, 1)
+            let y = max(0.12, min(0.5, 0.5 - bottomInset / (2.0 * h)))
+            let anchor = CGPoint(x: 0.5, y: y)
+            if abs(map.screenAnchor.y - anchor.y) > 0.002 { map.screenAnchor = anchor }
+        }
 
         if c.northSeq != northToken {
             c.northSeq = northToken
@@ -2262,6 +2357,7 @@ struct HomeMapView: UIViewRepresentable {
         }
         if c.recenterSeq != recenterToken {
             c.recenterSeq = recenterToken
+            c.userPannedMap = false          // 重新回到定位：恢复「抽屉跟随可见区」
             map.userTrackingMode = .follow
             map.setZoomLevel(16, animated: true)
         }
@@ -2285,6 +2381,12 @@ final class HomeMapDelegate: NSObject, UIGestureRecognizerDelegate, CLLocationMa
     var lastHeading: CLLocationDirection = -1
     var lastBeamDeg: Double = -999           // 光柱累积角度（跨 0/360 时走最短路径，不绕圈）
     weak var userDotView: MAAnnotationView?
+    /// 用户是否手动平移过地图：滑过之后抽屉上下拖动不再改可见区中心
+    var userPannedMap = false
+
+    @objc func userDidPanMap(_ g: UIPanGestureRecognizer) {
+        if g.state == .began || g.state == .changed { userPannedMap = true }
+    }
 
     func startHeading() {
         guard CLLocationManager.headingAvailable() else { return }
