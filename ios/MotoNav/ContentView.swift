@@ -1229,7 +1229,9 @@ struct ContentView: View {
                         trafficSegs: (homeStage == .routes || addingVia) ? navi.trafficSegs : [],
                         dest: (homeStage == .routes || addingVia) ? navi.destCoord : nil,
                         vias: viaCoords,
-                        bottomInset: max(0, panelHeight(geo) + keyboardHeight - drawerDragY),
+                        // 拖动期间不再逐帧改写 bottomInset：只有抽屉档位 / 键盘状态变化才更新。
+                        // 否则 SwiftUI 每帧调 updateUIView 写 screenAnchor，UIKit 地图会被反复重绘而卡顿。
+                        bottomInset: max(0, panelHeight(geo) + keyboardHeight),
                         onRotation: { rotated in mapRotated = rotated },
                         onPoiTap: { name, coord in selectMapPoi(name: name, coord: coord) },
                         onBlankTap: { if poiSelected && homeStage == .place { resetHome() } },
@@ -1386,17 +1388,23 @@ struct ContentView: View {
                     homeSearchBar.padding(.horizontal, 14).padding(.bottom, 10)
                 }
             }
-            // 手势只加在「抓手 + 搜索框」区域：拖动中抽屉跟手，地图可见区同步收放；
-            // 松手再决定展开 / 收起，避免原来「拖完全程才有反应」的迟滞感。
-            .gesture(DragGesture(minimumDistance: 18)
+            // 手势只加在「抓手 + 搜索框」区域：拖动中只有抽屉自身跟手（轻量合成），地图完全静止；
+            // 松手按档位一次性调整可见区中心，避免每帧重绘 UIKit 地图造成卡顿。
+            // minimumDistance 降到 12：短距离拖动也能进入手势，减少被误判成点击 toggleSheet 的跳变。
+            .gesture(DragGesture(minimumDistance: 12)
                 .onChanged { v in
-                    drawerDragY = max(-70, min(140, v.translation.height))
+                    drawerDragY = max(-72, min(150, v.translation.height))
                 }
                 .onEnded { v in
                     let t = v.translation.height
-                    withAnimation(.spring(response: 0.34, dampingFraction: 0.86)) { drawerDragY = 0 }
-                    if t < -45 { expandDrawer() }
-                    else if t > 45 { collapseDrawer() }
+                    let up = t < -45, down = t > 45
+                    // 位移归零与档位切换放进同一条动画：不再叠加两个 spring，消除回抽与残影
+                    withAnimation(.spring(response: 0.32, dampingFraction: 0.9)) {
+                        drawerDragY = 0
+                        if up { drawerMinimized = false; sheetExpanded = true }
+                        else if down { sheetExpanded = false; drawerMinimized = true }
+                    }
+                    if up || down { hideKeyboard() }
                 })
 
             if showList {
@@ -1448,6 +1456,7 @@ struct ContentView: View {
             }
         )
         .overlay(TopRoundedShape(radius: 22, closed: false).stroke(ContentView.stroke, lineWidth: 1))
+        .clipped()      // 内容裁进抽屉圆角：展开/收起动画中不再溢出形成半透明残影
         .animation(.spring(response: 0.34, dampingFraction: 0.86), value: homeStage)
         .animation(.spring(response: 0.34, dampingFraction: 0.86), value: sheetExpanded)
         .animation(.spring(response: 0.34, dampingFraction: 0.86), value: hasSearchContent)
@@ -2257,16 +2266,18 @@ struct HomeMapView: UIViewRepresentable {
         c.onBlankTap = onBlankTap
         c.onRouteTap = onRouteTap
         c.selectedCoords = routes.first(where: { $0.id == selectedRouteID })?.coords ?? []
-        c.watchRotation(map)
+        // 方向光柱 / 旋转轮询的 Timer 在 makeUIView 里已启动且有 guard，无需每次 update 再调。
 
-        // 抽屉上下拖动时，可见地图区域跟着变：把跟随定位的蓝点放在「未被抽屉遮挡区域」的中心。
+        // 抽屉档位稳定后才调整可见区中心：把跟随定位的蓝点放在「未被抽屉遮挡区域」的中心。
+        // 拖动期间 bottomInset 不变，MAMapView 不会被 SwiftUI 反复要求重绘。
         // 可见区中心相对整屏的比例 = 0.5 - bottomInset / (2 * 屏高)，用高德 screenAnchor 表达。
         // 只在「正在跟随定位」且用户没手动滑过地图时生效；否则完全不干预，避免地图跳动。
-        if map.userTrackingMode == .follow && !c.userPannedMap {
+        // 用上一次的 bottomInset 做闸门：档位没变就不写 screenAnchor，杜绝每帧重绘地图。
+        if map.userTrackingMode == .follow && !c.userPannedMap && c.lastAnchorInset != bottomInset {
             let h = max(map.bounds.height, 1)
             let y = max(0.12, min(0.5, 0.5 - bottomInset / (2.0 * h)))
-            let anchor = CGPoint(x: 0.5, y: y)
-            if abs(map.screenAnchor.y - anchor.y) > 0.002 { map.screenAnchor = anchor }
+            map.screenAnchor = CGPoint(x: 0.5, y: y)
+            c.lastAnchorInset = bottomInset
         }
 
         if c.northSeq != northToken {
@@ -2358,6 +2369,7 @@ struct HomeMapView: UIViewRepresentable {
         if c.recenterSeq != recenterToken {
             c.recenterSeq = recenterToken
             c.userPannedMap = false          // 重新回到定位：恢复「抽屉跟随可见区」
+            c.lastAnchorInset = -1          // 强制按当前抽屉档位重算可见区中心
             map.userTrackingMode = .follow
             map.setZoomLevel(16, animated: true)
         }
@@ -2383,6 +2395,9 @@ final class HomeMapDelegate: NSObject, UIGestureRecognizerDelegate, CLLocationMa
     weak var userDotView: MAAnnotationView?
     /// 用户是否手动平移过地图：滑过之后抽屉上下拖动不再改可见区中心
     var userPannedMap = false
+    /// 上一次用于计算 screenAnchor 的 bottomInset：档位没变就一次都不写地图属性，
+    /// 阻断「SwiftUI 每帧刷新 -> updateUIView -> screenAnchor -> UIKit 地图重绘」这条卡顿链
+    var lastAnchorInset: CGFloat = -1
 
     @objc func userDidPanMap(_ g: UIPanGestureRecognizer) {
         if g.state == .began || g.state == .changed { userPannedMap = true }
