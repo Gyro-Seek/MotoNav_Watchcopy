@@ -517,6 +517,14 @@ extension BleLink: CBCentralManagerDelegate, CBPeripheralDelegate {
             mediaHIDMode = parts[1] == "1"; mediaHIDReady = parts[2] == "1"
             MusicBridge.shared.refresh(force: true); return
         }
+        // Firmware replies N,type,id when a bulk payload fails to decode (BulkReceiver.h).
+        // Without this branch the phone keeps re-sending the identical bad packet forever.
+        if parts.first == "N", parts.count >= 3, let t = Int(parts[1]), let id = Int(parts[2]) {
+            bulkQ.clear(type: t)
+            MapFeeder.shared.onNack(type: t, id: id)
+            pump()                         // clear(type:) may have dropped the in-flight write
+            return
+        }
         if parts.first == "K", parts.count >= 3, let t = Int(parts[1]), let id = Int(parts[2]) {
             bulkQ.acknowledge(type: t, id: id)
             MapFeeder.shared.onAck(type: t, id: id)

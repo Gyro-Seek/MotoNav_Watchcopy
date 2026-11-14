@@ -83,6 +83,11 @@ final class MapFeeder: ObservableObject {
     private var pose: (x: Double, y: Double, kmh: Int)?
     private var chunkBuildingsComplete = false
     private var confirmedCenter: (x: Double, y: Double)?
+    // NACK recovery: a rejected frame must change its bytes or its id, otherwise the
+    // firmware will reject the retransmission in exactly the same way (infinite loop).
+    private var nackStreak = 0
+    private var forceLegacyRaster = false
+    private var lastNackAt = Date.distantPast
     private var lastCoverageTrace = Date.distantPast
     private var buildingMode: Bool { Settings.shared.theme == 1 && Settings.shared.mapSource == Self.SRC_AMAP && Settings.shared.buildings && BleLink.shared.buildingsSupported }
 
@@ -91,7 +96,10 @@ final class MapFeeder: ObservableObject {
     private var satMode: Bool { Settings.shared.theme == MapFeeder.THEME_SAT }
 
     /// Preserve prepared offline packets when navigation starts.
-    func onNaviStart() { routeKey = "" }
+    func onNaviStart() {
+        routeKey = ""
+        nackStreak = 0; forceLegacyRaster = false; lastNackAt = .distantPast
+    }
     func onNaviEnd() {
         offlineMaps?.close(); offlineMaps = nil; offlineKey = ""
         preparedCoords = []; preparedKey = ""; offlineStatus = "沿线下载已暂停，重新选择路线后继续"
@@ -276,7 +284,7 @@ final class MapFeeder: ObservableObject {
     private func sendChunk() {
         guard let b = chunkBytes, enabled, Settings.shared.theme != 11 else { return }
         chunkSentAt = Date()
-        let wire = BleLink.shared.buildingsSupported ? b : RasterPacket.forLegacy(b)
+        let wire = (BleLink.shared.buildingsSupported && !forceLegacyRaster) ? b : RasterPacket.forLegacy(b)
         MapPipelineTrace.packet(wire, type: chunkType, id: chunkId, ready: BleLink.shared.isReady)
         BleLink.shared.sendBulk(type: chunkType, id: chunkId, data: wire)
     }
@@ -349,10 +357,43 @@ final class MapFeeder: ObservableObject {
         if type == chunkType && id == chunkId {
             chunkAcked = true; status = "圆屏已收到地图"
             confirmedCenter = (chunkCx, chunkCy)
+            nackStreak = 0
             MapPipelineTrace.event("map-ack", ["type": type, "id": id, "buildings": chunkBytes.map(RasterPacket.isBuilding) ?? false])
         }
         if type == MapFeeder.TYPE_ROUTE && id == routeId { routeAcked = true }
         if type == MapFeeder.TYPE_GHOST && id == ghostId { ghostAcked = true }
+    }
+
+    /// 圆屏回 "N,类型,编号"：这一份大包解码失败。
+    /// 固件在 BulkReceiver.h 里会清空该类型的分片掩码，所以手机必须发一份
+    /// 内容或编号都不同的新包，否则每 2 秒重发的仍是同一份坏包。
+    func onNack(type: Int, id: Int) {
+        guard type == TYPE_RASTER, id == chunkId, let b = chunkBytes, enabled else { return }
+        let now = Date()
+        if now.timeIntervalSince(lastNackAt) < 1.0 { return }   // 固件与 checkResend 会双向放大，节流
+        lastNackAt = now
+        nackStreak += 1
+        MapPipelineTrace.event("map-nack", ["id": id, "streak": nackStreak,
+            "bytes": b.count, "buildings": RasterPacket.isBuilding(b)])
+        if nackStreak <= 2 {
+            // 降级到无楼块兼容包（更小、走最简单的解码路径）并换编号重发。
+            forceLegacyRaster = true
+            chunkBytes = RasterPacket.forLegacy(b)
+            chunkId = (chunkId + 1) & 0xFF
+            chunkAcked = false
+            chunkBuildingsComplete = false
+            status = "圆屏拒绝底图，正在用兼容底图重发（第 \(nackStreak) 次）"
+            buildingInfo = "已临时关闭建筑底图以恢复地图"
+            sendChunk()
+        } else {
+            // 连续三次仍被拒：这份数据本身有问题，丢弃并强制重新截图出图。
+            status = "圆屏连续拒绝底图，正在重新准备地图"
+            buildingInfo = ""
+            chunkBytes = nil; haveChunk = false; confirmedCenter = nil
+            workToken.cancel(); requestSerial += 1; fetching = false
+            lastFetchFail = .distantPast
+            nackStreak = 0
+        }
     }
 
     /// 蓝牙重新连上 / 小地图重新打开：圆屏可能重启过，全部重发
