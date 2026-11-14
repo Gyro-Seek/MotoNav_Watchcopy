@@ -44,8 +44,12 @@ struct ContentView: View {
     @State private var addingVia = false               // 正在搜途经点
     @State private var viaManager = false              // 途经点管理面板（增删 / 拖动排序）
     @State private var viaEditMode = EditMode.active   // 途经点列表常显拖拽手柄
-    @State private var viaDragID: UUID? = nil          // 停靠站卡片里正在拖动的途经点
-    @State private var viaDragY: CGFloat = 0           // 拖动时的纵向偏移（视觉反馈）
+    @State private var dragRows: [NaviBridge.Stop]? = nil   // 拖动中的站点顺序（实时重排，松手才 replan）
+    @State private var dragStartIndex: Int? = nil
+    @State private var draggingStopID: String? = nil
+    @State private var showRecentAll = false            // 「最近搜索 ›」二级菜单（看全部记录）
+    @State private var favEditID: UUID? = nil            // 点「地点」图标：内联展开改备注 / 去这里 / 移除
+    @State private var favEditName = ""
     @Environment(\.scenePhase) private var scenePhase
     @State private var lastHandledShare = ""        // 去重：onOpenURL 和前台自动消费可能同时到
     @State private var sheetExpanded = false         // 首页底部搜索抽屉：上滑展开更多入口
@@ -114,6 +118,7 @@ struct ContentView: View {
         .sheet(isPresented: $showSettings) { settingsHub }
         .sheet(isPresented: $showRouteDetail) { RouteDetailView() }
         .sheet(isPresented: $showRouteOptions) { RouteOptionsView() }
+        .sheet(isPresented: $showRecentAll) { recentAllSheet }
         // 换了阶段（搜索 / 地点 / 路线）就自动恢复抽屉，避免停在「缩到最小」的状态
         .onChange(of: homeStage) { _ in drawerMinimized = false }
         .onAppear {                                    // iOS v0.7 打开 App 时，高德 key 没填就提醒一次
@@ -293,7 +298,7 @@ struct ContentView: View {
         !search.results.isEmpty || !search.status.isEmpty || !shareStatus.isEmpty
     }
 
-    /// 搜索态：只放实时检索结果；最近去过改到 recentSection，上滑才出现
+    /// 搜索态：只放实时检索结果；最近搜索改到 recentSection，上滑才出现
     @ViewBuilder
     private var searchResultSection: some View {
         if !shareStatus.isEmpty { Text(shareStatus).font(.footnote).foregroundColor(ContentView.sub) }
@@ -316,60 +321,90 @@ struct ContentView: View {
         }
     }
 
-    /// 最近去过：左滑单条删除；只在抽屉上滑展开 / 搜途经点时出现
+    /// 最近搜索（苹果地图式）：标题带 › 进二级菜单看全部；主界面是横向分页卡片，
+    /// 每页 3 条、最多 3 页（9 条），第 10 条起收进二级菜单。
     private var recentSection: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack {
-                Text(addingVia ? "从最近去过里选途经点" : "最近去过")
-                    .font(.caption).foregroundColor(ContentView.sub)
-                Spacer()
-                if !history.places.isEmpty {
-                    Button("清除记录") { history.clear() }
-                        .font(.caption).foregroundColor(ContentView.sub)
+        VStack(alignment: .leading, spacing: 8) {
+            Button { showRecentAll = true } label: {
+                HStack(spacing: 4) {
+                    Text("最近搜索").font(.headline).foregroundColor(ContentView.ink)
+                    Image(systemName: "chevron.right").font(.caption.weight(.semibold))
+                        .foregroundColor(ContentView.sub)
+                    Spacer()
+                    if !history.places.isEmpty {
+                        Text("查看全部").font(.caption).foregroundColor(ContentView.cyan)
+                    }
                 }
             }
+            .buttonStyle(.plain)
             if history.places.isEmpty {
                 Text("暂无记录").font(.caption2).foregroundColor(ContentView.sub)
             } else {
-                recentList
+                recentPager
             }
         }
     }
 
-    /// 只有 List 的行支持系统 swipeActions；固定高度避免和外层 ScrollView 抢滚动
-    private var recentList: some View {
-        let rows: [SearchService.Place] = Array(history.places.prefix(8))
-        let h: CGFloat = CGFloat(rows.count) * 54
-        return List {
-            ForEach(rows) { p in recentRow(p) }
+    /// 每页 3 条；TabView 横滑分页，右侧留一点缝露出下一张卡片（苹果地图式）
+    private var recentPager: some View {
+        let rows = Array(history.places.prefix(9))
+        let pages = stride(from: 0, to: rows.count, by: 3)
+            .map { Array(rows[$0..<min($0 + 3, rows.count)]) }
+        return TabView {
+            ForEach(pages.indices, id: \.self) { i in
+                VStack(spacing: 0) {
+                    ForEach(pages[i].indices, id: \.self) { j in
+                        recentPageRow(pages[i][j])
+                        if j < pages[i].count - 1 { Divider().background(ContentView.stroke) }
+                    }
+                    Spacer(minLength: 0)
+                }
+                .padding(.vertical, 4).padding(.horizontal, 12)
+                .background(RoundedRectangle(cornerRadius: 16).fill(ContentView.card))
+                .padding(.trailing, 14)
+            }
         }
-        .listStyle(.plain)
-        .background(ContentView.bg)
-        .frame(height: h)
+        .tabViewStyle(.page(indexDisplayMode: .never))
+        .frame(height: 3 * 54 + 16)
     }
 
-    private func recentRow(_ p: SearchService.Place) -> some View {
-        Button { choose(p) } label: {
-            HStack(alignment: .center, spacing: 8) {
+    private func recentPageRow(_ p: SearchService.Place) -> some View {
+        Button { showRecentAll = false; choose(p) } label: {
+            HStack(spacing: 10) {
+                Image(systemName: recentGlyph(p))
+                    .font(.system(size: 13, weight: .semibold)).foregroundColor(.white)
+                    .frame(width: 30, height: 30)
+                    .background(Circle().fill(recentTint(p)))
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(p.name).foregroundColor(ContentView.ink).lineLimit(1)
+                    Text(p.name).font(.subheadline).foregroundColor(ContentView.ink).lineLimit(1)
                     if !p.address.isEmpty {
-                        Text(p.address).font(.caption).foregroundColor(ContentView.sub).lineLimit(1)
+                        Text(p.address).font(.caption2).foregroundColor(ContentView.sub).lineLimit(1)
                     }
                 }
                 Spacer(minLength: 4)
-                if let d = distanceTo(p) { Text(d).font(.caption).foregroundColor(ContentView.cyan) }
+                if let d = distanceTo(p) { Text(d).font(.caption2).foregroundColor(ContentView.sub) }
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.vertical, 4)
+            .frame(maxWidth: .infinity, minHeight: 54)
+            .contentShape(Rectangle())
         }
-        .listRowBackground(ContentView.card)
-        .listRowInsets(EdgeInsets(top: 3, leading: 10, bottom: 3, trailing: 10))
-        .swipeActions(edge: .trailing, allowsFullSwipe: true) {
-            Button(role: .destructive) { history.remove(p) } label: {
-                Label("删除", systemImage: "trash")
-            }
-        }
+        .buttonStyle(.plain)
+    }
+
+    private func recentGlyph(_ p: SearchService.Place) -> String {
+        let g = ["mappin.circle.fill", "clock.fill", "star.fill",
+                 "car.fill", "flag.fill", "building.2.fill"]
+        let i = (history.places.firstIndex(where: { $0.id == p.id }) ?? 0) % g.count
+        return g[i]
+    }
+
+    private func recentTint(_ p: SearchService.Place) -> Color {
+        let c: [Color] = [
+            Color(red: 0.10, green: 0.55, blue: 0.95), Color(red: 0.95, green: 0.55, blue: 0.15),
+            Color(red: 0.62, green: 0.42, blue: 0.85), Color(red: 0.25, green: 0.72, blue: 0.45),
+            Color(red: 0.58, green: 0.62, blue: 0.70), Color(red: 0.95, green: 0.35, blue: 0.55)
+        ]
+        let i = (history.places.firstIndex(where: { $0.id == p.id }) ?? 0) % c.count
+        return c[i]
     }
 
     /// 途经点管理页顶栏：左「返回」+ 标题 + 右「完成」
@@ -484,11 +519,20 @@ struct ContentView: View {
                     }
                 }
                 HStack(spacing: 10) {
-                    Button { favorites.add(d) } label: {
-                        Label("收藏", systemImage: "star")
-                            .font(.subheadline).foregroundColor(ContentView.cyan)
-                            .frame(maxWidth: .infinity, minHeight: 46)
-                            .background(RoundedRectangle(cornerRadius: 12).fill(ContentView.stroke.opacity(0.35)))
+                    if isFavorite(d) {
+                        Button { removeFavorite(d) } label: {
+                            Label("已收藏", systemImage: "star.fill")
+                                .font(.subheadline).foregroundColor(ContentView.pink)
+                                .frame(maxWidth: .infinity, minHeight: 46)
+                                .background(RoundedRectangle(cornerRadius: 12).fill(ContentView.pink.opacity(0.14)))
+                        }
+                    } else {
+                        Button { favorites.add(d) } label: {
+                            Label("收藏", systemImage: "star")
+                                .font(.subheadline).foregroundColor(ContentView.cyan)
+                                .frame(maxWidth: .infinity, minHeight: 46)
+                                .background(RoundedRectangle(cornerRadius: 12).fill(ContentView.stroke.opacity(0.35)))
+                        }
                     }
                     Button { startRoutePlanning() } label: {
                         Label("路线", systemImage: "arrow.triangle.turn.up.right.diamond")
@@ -588,58 +632,35 @@ struct ContentView: View {
         .buttonStyle(.plain)
     }
 
-    /// 起终点 / 途经点 / 添加停靠站：照抄苹果地图的列表式停靠站卡片
+    /// 停靠站统一列表：起点 / 途经点 / 终点全部可拖动换序；删除按钮不再常显，改为左滑出现。
+    /// 用系统 List + swipeActions（左滑删除）+ 手柄 DragGesture（拖动中实时重排，交互跟手）。
     private var routeStopsCard: some View {
-        VStack(spacing: 0) {
-            stopRow(icon: "location.fill", tint: ContentView.cyan,
-                    title: "我的位置", tag: "起点", handle: false)
-            Divider().background(ContentView.stroke)
-            ForEach(navi.vias) { v in
-                HStack(spacing: 10) {
-                    Image(systemName: "circle.fill").font(.system(size: 8))
-                        .foregroundColor(ContentView.cyan).frame(width: 22, height: 22)
-                    Text(v.name).font(.subheadline).foregroundColor(ContentView.ink).lineLimit(1)
-                    Spacer(minLength: 4)
-                    Button { navi.removeVia(id: v.id) } label: {
-                        Image(systemName: "minus.circle.fill").foregroundColor(ContentView.pink)
-                    }
-                    .buttonStyle(.borderless)
-                    // 右侧把手现在真的能拖动：上下跨过一行即调序，松手后只重新规划一次
-                    Image(systemName: "line.horizontal.3").font(.caption).foregroundColor(ContentView.sub)
-                        .frame(width: 30, height: 30)
-                        .contentShape(Rectangle())
-                        .highPriorityGesture(
-                            DragGesture(minimumDistance: 6)
-                                .onChanged { g in
-                                    viaDragID = v.id
-                                    viaDragY = g.translation.height
-                                }
-                                .onEnded { g in
-                                    let rows = Int((g.translation.height / 44).rounded())
-                                    if rows != 0, let from = navi.vias.firstIndex(where: { $0.id == v.id }) {
-                                        let to = min(max(from + rows, 0), navi.vias.count - 1)
-                                        navi.moveVia(from: from, to: to)
-                                    }
-                                    viaDragID = nil
-                                    viaDragY = 0
-                                }
-                        )
+        let stops = dragRows ?? routeStops
+        let rowH: CGFloat = 52
+        return VStack(spacing: 0) {
+            List {
+                ForEach(stops) { s in
+                    stopListRow(s, isFirst: s.id == stops.first?.id,
+                                isLast: s.id == stops.last?.id)
+                        .listRowBackground(ContentView.card)
+                        .listRowSeparator(.hidden)
+                        .listRowInsets(EdgeInsets(top: 0, leading: 12, bottom: 0, trailing: 12))
+                        .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                            Button(role: .destructive) { deleteStop(s) } label: {
+                                Label("删除", systemImage: "trash")
+                            }
+                        }
                 }
-                .padding(.vertical, 9)
-                .offset(y: viaDragID == v.id ? viaDragY : 0)
-                .zIndex(viaDragID == v.id ? 1 : 0)
-                Divider().background(ContentView.stroke)
             }
-            stopRow(icon: "flag.fill", tint: ContentView.pink,
-                    title: dest?.name ?? "目的地", tag: "终点", handle: true)
-            Divider().background(ContentView.stroke)
+            .listStyle(.plain)
+            .background(ContentView.card)
+            .frame(height: max(CGFloat(stops.count) * rowH, rowH))
             Button { openViaSearch() } label: {
                 HStack(spacing: 10) {
                     Image(systemName: "plus.circle.fill").font(.system(size: 20))
                         .foregroundColor(ContentView.cyan)
                     Text("添加停靠站").font(.subheadline).foregroundColor(ContentView.cyan)
                     Spacer(minLength: 4)
-                    Image(systemName: "line.horizontal.3").font(.caption).foregroundColor(ContentView.sub)
                 }
                 .padding(.vertical, 9)
                 .contentShape(Rectangle())
@@ -652,19 +673,93 @@ struct ContentView: View {
         .overlay(RoundedRectangle(cornerRadius: 16).stroke(ContentView.stroke, lineWidth: 1))
     }
 
-    private func stopRow(icon: String, tint: Color, title: String,
-                         tag: String, handle: Bool) -> some View {
-        HStack(spacing: 10) {
-            Image(systemName: icon).font(.system(size: 13, weight: .semibold))
-                .foregroundColor(ContentView.bg)
+    /// 由 NaviBridge 的真实状态派生站点数组；拖动时用 dragRows 覆盖，松手后一次性写回。
+    private var routeStops: [NaviBridge.Stop] {
+        var a: [NaviBridge.Stop] = []
+        let me = navi.myPosition()
+        if let s = navi.customStart {
+            a.append(NaviBridge.Stop(id: "start", name: s.name, lat: s.lat, lng: s.lng, myLocation: false))
+        } else {
+            a.append(NaviBridge.Stop(id: "start", name: "我的位置",
+                                     lat: me?.lat ?? 0, lng: me?.lng ?? 0, myLocation: true))
+        }
+        for v in navi.vias {
+            a.append(NaviBridge.Stop(id: v.id.uuidString, name: v.name,
+                                     lat: v.lat, lng: v.lng, myLocation: false))
+        }
+        if let d = dest {
+            a.append(NaviBridge.Stop(id: "end", name: d.name, lat: d.lat, lng: d.lng, myLocation: false))
+        }
+        return a
+    }
+
+    private func stopListRow(_ s: NaviBridge.Stop, isFirst: Bool, isLast: Bool) -> some View {
+        let icon = isFirst ? "location.fill" : (isLast ? "flag.fill" : "circle.fill")
+        let tint = isFirst ? ContentView.cyan : (isLast ? ContentView.pink : ContentView.sub)
+        let tag = isFirst ? "起点" : (isLast ? "终点" : "途经")
+        return HStack(spacing: 10) {
+            Image(systemName: icon).font(.system(size: 12, weight: .semibold))
+                .foregroundColor(.white)
                 .frame(width: 22, height: 22)
                 .background(Circle().fill(tint))
-            Text(title).font(.subheadline).foregroundColor(ContentView.ink).lineLimit(1)
+            Text(s.name).font(.subheadline).foregroundColor(ContentView.ink).lineLimit(1)
             Spacer(minLength: 4)
             Text(tag).font(.caption2).foregroundColor(ContentView.sub)
-            if handle { Image(systemName: "line.horizontal.3").font(.caption).foregroundColor(ContentView.sub) }
+            // 右侧拖动把手：整条把手区域接管纵向拖动，拖动中实时把这一行插到目标位置
+            Image(systemName: "line.horizontal.3").font(.caption)
+                .foregroundColor(ContentView.sub)
+                .frame(width: 34, height: 44)
+                .contentShape(Rectangle())
+                .highPriorityGesture(stopDragGesture(s))
         }
-        .padding(.vertical, 9)
+        .frame(height: 52)
+        .background(draggingStopID == s.id ? ContentView.cyan.opacity(0.12) : Color.clear)
+        .cornerRadius(8)
+    }
+
+    private func stopDragGesture(_ s: NaviBridge.Stop) -> some Gesture {
+        DragGesture(minimumDistance: 5)
+            .onChanged { g in
+                guard navi.shareRoute == nil else { return }
+                if dragRows == nil {
+                    let base = routeStops
+                    dragRows = base
+                    dragStartIndex = base.firstIndex(where: { $0.id == s.id }) ?? 0
+                    draggingStopID = s.id
+                }
+                guard var rows = dragRows, let start = dragStartIndex,
+                      let cur = rows.firstIndex(where: { $0.id == draggingStopID }) else { return }
+                let target = min(max(start + Int((g.translation.height / 52).rounded()), 0), rows.count - 1)
+                guard cur != target else { return }
+                withAnimation(.easeInOut(duration: 0.12)) {
+                    let item = rows.remove(at: cur)
+                    rows.insert(item, at: target)
+                    dragRows = rows
+                }
+            }
+            .onEnded { _ in
+                if let rows = dragRows { commitStops(rows) }
+                dragRows = nil; dragStartIndex = nil; draggingStopID = nil
+            }
+    }
+
+    /// 拖动 / 删除落定：第一个站点是新起点、最后一个是新终点、中间是途经点。
+    private func commitStops(_ rows: [NaviBridge.Stop]) {
+        guard rows.count >= 2, navi.shareRoute == nil, let last = rows.last else { return }
+        // 终点变了：同步地点卡 / 地图相机用的 dest
+        dest = SearchService.Place(name: last.name, address: dest?.address ?? "",
+                                   lat: last.lat, lng: last.lng)
+        navi.applyStops(rows)
+        overviewToken += 1
+    }
+
+    private func deleteStop(_ s: NaviBridge.Stop) {
+        guard navi.shareRoute == nil else { return }
+        var rows = dragRows ?? routeStops
+        guard rows.count > 2 else { return }         // 至少保留起点 + 终点
+        rows.removeAll { $0.id == s.id }
+        guard rows.count >= 2 else { return }
+        commitStops(rows)
     }
 
     /// 固定在抽屉底部的路线分页卡片：左右滑动切换方案（苹果地图式分页圆点）
@@ -890,11 +985,21 @@ struct ContentView: View {
         overviewToken += 1
     }
 
-    /// 离现在位置的直线距离（搜索结果、最近去过右边显示）
+    /// 离现在位置的直线距离（搜索结果、最近搜索右边显示）
     private func distanceTo(_ p: SearchService.Place) -> String? {
         guard let me = navi.myPosition() else { return nil }
         let d = Int(NaviBridge.distM(me.lat, me.lng, p.lat, p.lng))
         return d >= 1000 ? String(format: "%.1f 公里", Double(d) / 1000) : "\(d) 米"
+    }
+
+    /// 收藏判定：和 Favorites.add 一致，同名或 50 米内视为同一个地点
+    private func isFavorite(_ p: SearchService.Place) -> Bool {
+        favorites.places.contains { NaviBridge.distM($0.lat, $0.lng, p.lat, p.lng) < 50 }
+    }
+    private func removeFavorite(_ p: SearchService.Place) {
+        if let f = favorites.places.first(where: { NaviBridge.distM($0.lat, $0.lng, p.lat, p.lng) < 50 }) {
+            favorites.remove(f)
+        }
     }
 
     /// 剩余秒数 → 到达时间“18:52”
@@ -906,7 +1011,7 @@ struct ContentView: View {
     /// 点了搜索结果 / 自动检索结果：地图定位到该地点并出「路线」按钮。
     /// autoPlan = true 只给「分享后自动导航」用，选中即算路并自动开始导航。
     private func choose(_ p: SearchService.Place, autoPlan: Bool = false) {
-        showSettings = false          // 从设置中心的「常用目的地」选点时，先回到地图
+        showSettings = false          // 从设置中心的「地点」选点时，先回到地图
         guard !navi.navigating else { shareStatus = "导航仍在运行；如需更换目的地，请先结束导航"; return }
         guard !WebMotorSession.shared.running else { shareStatus = "请先结束网页导航"; return }
         searchWork?.cancel()
@@ -1207,7 +1312,7 @@ struct ContentView: View {
         return min(raw, max(122, avail))
     }
 
-    /// 抽屉：抓手 + 搜索框固定；上滑展开搜索结果 / 最近去过 / 常用目的地。
+    /// 抽屉：抓手 + 搜索框固定；上滑展开搜索结果 / 地点 / 最近搜索。
     /// 「快捷功能」板块已移除，入口统一收进搜索条右侧的齿轮设置中心。
     /// 背景延伸到屏幕物理底边（底边直角 + 忽略底部安全区），内容按 bottomSafe 留白避开 home indicator。
     private func homeDrawer(height: CGFloat, bottomSafe: CGFloat) -> some View {
@@ -1246,8 +1351,8 @@ struct ContentView: View {
                             }
                             // 「快捷功能」板块已整体移除：巡航 / 独立路线 / 骑行轨迹 /
                             // 车辆与限行 / 全部设置都收进搜索条右侧的齿轮设置中心
-                            if homeStage == .idle && (addingVia || sheetExpanded) { recentSection }
                             if homeStage == .idle && sheetExpanded { favoritesCard }
+                            if homeStage == .idle && (addingVia || sheetExpanded) { recentSection }
                             if !shareStatus.isEmpty && homeStage != .idle {
                                 Text(shareStatus).font(.caption2).foregroundColor(ContentView.sub)
                             }
@@ -1394,7 +1499,7 @@ struct ContentView: View {
                         settingsRow("导航语音", "音色 · 语速 · 播报", "speaker.wave.2", ContentView.pink)
                     }
                     NavigationLink(destination: AnyView(settingsDetail(.favorites))) {
-                        settingsRow("常用目的地", "\(favorites.places.count) 个地点", "star.fill", ContentView.pink)
+                        settingsRow("地点", "\(favorites.places.count) 个地点", "star.fill", ContentView.pink)
                     }
                     Button { hubRides = true } label: {
                         settingsRow("骑行轨迹", "历史行程", "map", ContentView.cyan)
@@ -1668,18 +1773,162 @@ struct ContentView: View {
             Toggle("弯道急缓上色", isOn: $settings.curve).foregroundColor(ContentView.ink).tint(ContentView.pink)
         }
     }
+    /// 地点（苹果地图式）：一排横向滚动的彩色圆形图标，点按进入改备注 / 去这里 / 移除。
     private var favoritesCard: some View {
-        CardView {
-            Text("常用目的地").foregroundColor(ContentView.ink).bold()
-            if favorites.places.isEmpty { Text("选择目的地后点收藏").foregroundColor(Self.sub) }
-            ForEach(favorites.places) { place in
-                HStack {
-                    Button(place.name) { choose(place.searchPlace) }.foregroundColor(Self.cyan)
-                    Spacer()
-                    Button("移除") { favorites.remove(place) }.foregroundColor(Self.sub)
+        VStack(alignment: .leading, spacing: 10) {
+            Text("地点").font(.headline).foregroundColor(ContentView.ink)
+            if favorites.places.isEmpty {
+                Text("搜索一个地点后点「收藏」即可加入").font(.caption).foregroundColor(ContentView.sub)
+            } else {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(alignment: .top, spacing: 20) {
+                        ForEach(favorites.places.indices, id: \.self) { i in
+                            placeBubble(i: i, place: favorites.places[i])
+                        }
+                    }
+                    .padding(.trailing, 8)
+                }
+            }
+            // 点图标后内联展开编辑条（不用 sheet：设置中心页也是本视图，避免 sheet 套 sheet 被系统收起）
+            if favEditID != nil { favEditBar }
+        }
+    }
+
+    private func placeBubble(i: Int, place: Favorites.Place) -> some View {
+        Button {
+            favEditID = place.id
+            favEditName = place.name
+        } label: {
+            VStack(spacing: 6) {
+                ZStack(alignment: .topTrailing) {
+                    Circle().fill(placeTint(i)).frame(width: 62, height: 62)
+                        .overlay(Image(systemName: placeGlyph(i))
+                            .font(.system(size: 25, weight: .semibold)).foregroundColor(.white))
+                    // 苹果地图式右上角「…」编辑入口
+                    Image(systemName: "ellipsis.circle.fill")
+                        .font(.system(size: 15)).foregroundColor(ContentView.sub)
+                        .background(Circle().fill(ContentView.card))
+                        .offset(x: 7, y: -3)
+                }
+                Text(place.name).font(.caption).foregroundColor(ContentView.ink).lineLimit(1)
+                if let d = distanceTo(place.searchPlace) {
+                    Text(d).font(.caption2).foregroundColor(ContentView.sub)
+                }
+            }
+            .frame(width: 86)
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func placeGlyph(_ i: Int) -> String {
+        let g = ["house.fill", "briefcase.fill", "storefront.fill", "building.2.fill",
+                 "flag.fill", "bed.double.fill", "fork.knife", "cart.fill"]
+        return g[i % g.count]
+    }
+
+    private func placeTint(_ i: Int) -> Color {
+        let c: [Color] = [
+            Color(red: 0.10, green: 0.55, blue: 0.95), Color(red: 0.62, green: 0.42, blue: 0.30),
+            Color(red: 1.00, green: 0.68, blue: 0.10), Color(red: 0.58, green: 0.62, blue: 0.70),
+            Color(red: 0.62, green: 0.42, blue: 0.85), Color(red: 0.25, green: 0.72, blue: 0.45),
+            Color(red: 0.95, green: 0.35, blue: 0.55), Color(red: 0.20, green: 0.72, blue: 0.72)
+        ]
+        return c[i % c.count]
+    }
+
+    /// 「最近搜索 ›」二级菜单：全部记录（最多 12 条），左滑删除、可清除
+    private var recentAllSheet: some View {
+        NavigationView {
+            List {
+                ForEach(history.places) { p in
+                    Button { showRecentAll = false; choose(p) } label: {
+                        HStack(spacing: 10) {
+                            Image(systemName: recentGlyph(p))
+                                .font(.system(size: 13, weight: .semibold)).foregroundColor(.white)
+                                .frame(width: 30, height: 30)
+                                .background(Circle().fill(recentTint(p)))
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(p.name).foregroundColor(ContentView.ink).lineLimit(1)
+                                if !p.address.isEmpty {
+                                    Text(p.address).font(.caption).foregroundColor(ContentView.sub).lineLimit(1)
+                                }
+                            }
+                            Spacer(minLength: 4)
+                            if let d = distanceTo(p) {
+                                Text(d).font(.caption2).foregroundColor(ContentView.sub)
+                            }
+                        }
+                    }
+                    .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+                        Button(role: .destructive) { history.remove(p) } label: {
+                            Label("删除", systemImage: "trash")
+                        }
+                    }
+                }
+            }
+            .listStyle(.insetGrouped)
+            .navigationTitle("最近搜索")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) {
+                    Button("清除记录") { history.clear() }.foregroundColor(ContentView.pink)
+                        .disabled(history.places.isEmpty)
+                }
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("完成") { showRecentAll = false }.foregroundColor(ContentView.cyan)
                 }
             }
         }
+    }
+
+    /// 点「地点」图标后内联展开的编辑条：改备注 / 去这里 / 移除
+    private var favEditBar: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
+                Image(systemName: "pencil").font(.caption).foregroundColor(ContentView.cyan)
+                TextField("给它起个名字（家 / 公司 …）", text: $favEditName)
+                    .textFieldStyle(.roundedBorder)
+                    .foregroundColor(ContentView.ink)
+                Button("保存") { saveFavName() }
+                    .font(.subheadline).foregroundColor(ContentView.cyan)
+                Button { favEditID = nil } label: {
+                    Image(systemName: "xmark.circle.fill").foregroundColor(ContentView.sub)
+                }
+                .buttonStyle(.plain)
+            }
+            HStack(spacing: 18) {
+                Button { goToEditingFav() } label: {
+                    Label("去这里", systemImage: "arrow.triangle.turn.up.right.diamond")
+                        .font(.caption).foregroundColor(ContentView.cyan)
+                }
+                Button(role: .destructive) { removeEditingFav() } label: {
+                    Label("移除该地点", systemImage: "trash")
+                        .font(.caption)
+                }
+                Spacer(minLength: 0)
+            }
+        }
+        .padding(12)
+        .background(RoundedRectangle(cornerRadius: 14).fill(ContentView.card))
+        .overlay(RoundedRectangle(cornerRadius: 14).stroke(ContentView.stroke, lineWidth: 1))
+    }
+
+    private func editingFav() -> Favorites.Place? {
+        guard let id = favEditID else { return nil }
+        return favorites.places.first { $0.id == id }
+    }
+    private func saveFavName() {
+        if let f = editingFav() { favorites.rename(f, to: favEditName) }
+        favEditID = nil
+    }
+    private func goToEditingFav() {
+        guard let f = editingFav() else { favEditID = nil; return }
+        favEditID = nil
+        choose(f.searchPlace)
+    }
+    private func removeEditingFav() {
+        if let f = editingFav() { favorites.remove(f) }
+        favEditID = nil
     }
     private var voiceCard: some View {
         CardView {
@@ -1849,7 +2098,7 @@ private enum SettingsPage: String, CaseIterable, Identifiable {
         case .debug: return "调试信息"
         case .cruise: return "巡航模式"
         case .routeModes: return "路线规划"
-        case .favorites: return "常用目的地"
+        case .favorites: return "地点"
         case .about: return "关于"
         }
     }

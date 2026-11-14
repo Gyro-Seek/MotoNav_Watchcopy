@@ -16,6 +16,15 @@ final class Favorites: ObservableObject {
         places.insert(Place(name: p.name, address: p.address, lat: p.lat, lng: p.lng), at: 0); save()
     }
     func remove(_ p: Place) { places.removeAll { $0.id == p.id }; save() }
+    /// 更改收藏地点的备注（显示名）；坐标不变，改完整体赋值以触发 @Published 刷新
+    func rename(_ p: Place, to newName: String) {
+        let t = newName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !t.isEmpty, let i = places.firstIndex(where: { $0.id == p.id }) else { return }
+        var arr = places
+        arr[i].name = t
+        places = arr
+        save()
+    }
     private func save() { if let data = try? JSONEncoder().encode(places) { UserDefaults.standard.set(data, forKey: "favorite_places") } }
 }
 

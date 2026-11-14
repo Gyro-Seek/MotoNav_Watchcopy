@@ -148,6 +148,18 @@ final class NaviBridge: NSObject, ObservableObject {
     @Published var shareMatch = ""                  // 和分享路线的吻合程度
     @Published private(set) var shareRoute: AmapShare.Route?
     struct Via: Identifiable { let id = UUID(); let name: String; let lat: Double; let lng: Double }
+
+    /// 首页停靠站列表的统一模型：第一个 = 起点、最后一个 = 终点、中间 = 途经点。
+    /// myLocation = true 表示「我的位置」；lat/lng 是派生时的定位快照，
+    /// 被拖到中间时也能当作一个普通途经点用。
+    struct Stop: Identifiable, Equatable {
+        var id: String
+        var name: String
+        var lat: Double
+        var lng: Double
+        var myLocation: Bool
+    }
+    @Published private(set) var customStart: Stop? = nil  // nil = 起点为「我的位置」（用实时定位）
     @Published private(set) var vias: [Via] = []     // iOS v0.4 途经点（分享的路线自带途经点，不用这个）
     var destCoord: CLLocationCoordinate2D? { destLat.isNaN ? nil : CLLocationCoordinate2D(latitude: destLat, longitude: destLng) }
     private var destLat = Double.nan, destLng = Double.nan
@@ -374,6 +386,7 @@ final class NaviBridge: NSObject, ObservableObject {
         guard !navigating,!WebMotorSession.shared.running else { return }
         attach()
         destLat = lat; destLng = lng
+        customStart = nil                            // 新目的地：起点回到「我的位置」
         shareRoute = share
         vias = []                                    // 新目的地：途经点清空
         replan()
@@ -408,6 +421,21 @@ final class NaviBridge: NSObject, ObservableObject {
         replan()
     }
 
+    /// 首页停靠站拖动 / 左滑删除后的整体重排：起点、终点也能被拖到任意位置。
+    /// ordered[0] = 新起点，ordered.last = 新终点，中间 = 途经点；随后重新算路。
+    func applyStops(_ ordered: [Stop]) {
+        guard ordered.count >= 2, !navigating,
+              !WebMotorSession.shared.running, shareRoute == nil else { return }
+        let first = ordered[0], last = ordered[ordered.count - 1]
+        customStart = first.myLocation ? nil
+            : Stop(id: "start", name: first.name, lat: first.lat, lng: first.lng, myLocation: false)
+        destLat = last.lat; destLng = last.lng
+        vias = ordered[1..<(ordered.count - 1)].map {
+            Via(name: $0.name, lat: $0.lat, lng: $0.lng)
+        }
+        replan()
+    }
+
     /// 不去这个目的地了（换目的地）
     func clearPlan() {
         if navigating { return }
@@ -418,7 +446,7 @@ final class NaviBridge: NSObject, ObservableObject {
         MapFeeder.shared.onNaviEnd()
         planSeq += 1
         destLat = .nan; destLng = .nan
-        shareRoute = nil; vias = []
+        shareRoute = nil; vias = []; customStart = nil
         calculating = false; routeReady = false; planFailed = false
         routeOptions = []; selectedRouteID = -1; shareMatch = ""; routeSummary = ""
         trafficSegs = []
@@ -461,8 +489,18 @@ final class NaviBridge: NSObject, ObservableObject {
             strategy = ConvertDrivingPreferenceToDrivingStrategy(true, true, avoid, false, false)     // 多条路线 + 躲避拥堵
             info = vias.isEmpty ? "正在规划路线…" : "正在规划路线（途经 \(vias.count) 个地方）…"
         }
+        // 起点优先级：拖动重排指定的自定义起点 > 当前定位 > 交给 SDK 用定位
+        let startPoint: AMapNaviPoint? = {
+            if let s = customStart {
+                return AMapNaviPoint.location(withLatitude: CGFloat(s.lat), longitude: CGFloat(s.lng))
+            }
+            if let me = me {
+                return AMapNaviPoint.location(withLatitude: CGFloat(me.lat), longitude: CGFloat(me.lng))
+            }
+            return nil
+        }()
         let ok: Bool
-        if let me = me, let start = AMapNaviPoint.location(withLatitude: CGFloat(me.lat), longitude: CGFloat(me.lng)) {
+        if let start = startPoint {
             ok = manager.calculateDriveRoute(withStart: [start], end: [end], wayPoints: wps, drivingStrategy: strategy)
         } else {
             ok = manager.calculateDriveRoute(withEnd: [end], wayPoints: wps, drivingStrategy: strategy)
